@@ -201,7 +201,7 @@ func TestCompareManifestsDetectsRootReplacementWithSameContentMetadata(t *testin
 	}
 }
 
-func TestNativeDirectoryCopyMergesContentsWithoutExtraSourceLayer(t *testing.T) {
+func TestAtomicDirectoryMergeKeepsContentsWithoutExtraSourceLayer(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("native cp is POSIX-only")
 	}
@@ -220,7 +220,7 @@ func TestNativeDirectoryCopyMergesContentsWithoutExtraSourceLayer(t *testing.T) 
 		t.Fatal(err)
 	}
 	result, err := Run(context.Background(), Operation{Source: endpoint.NewLocal(), Destination: endpoint.NewLocal(), SourcePath: source, TargetPath: target, Overwrite: true})
-	if err != nil || result.Verification != "same-machine-cp" {
+	if err != nil || result.Verification != "atomic-write" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 	for _, name := range []string{"new", "old"} {
