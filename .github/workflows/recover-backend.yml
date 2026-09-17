@@ -1,11 +1,11 @@
-name: recover-reviewed-backend
+name: validate-reviewed-backend
 on:
   pull_request:
     paths: ['.github/workflows/recover-backend.yml']
 permissions:
   contents: read
 jobs:
-  apply-and-validate:
+  validate-and-regenerate:
     if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -18,42 +18,26 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
-      - name: Recover the exact reviewed patch
-        id: patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p test-results
-          python3 - <<'PY'
-          import base64, gzip, hashlib, os, subprocess
-          from pathlib import Path
-          root = Path('.github/recovery')
-          if Path('internal/webgui/lifecycle.go').exists():
-              raise SystemExit('Recovery already applied; remove this one-time workflow')
-          part2 = (root/'02.txt').read_text().strip()
-          marker = 'H737E9JU74wS/lN+bc61'
-          assert part2.count(marker) == 1
-          part2 = part2.replace(marker, 'H737E9JU74w' + (root/'02-insert.txt').read_text().strip() + 'S/lN+bc61')
-          encoded = (root/'01.txt').read_text().strip() + part2 + (root/'03.txt').read_text().strip()
-          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
-          digest = hashlib.sha256(patch).hexdigest()
-          print('Reviewed patch SHA256:', digest)
-          assert digest == '5ab83af4d645b536c938da91ff44f4cf56f0e66c650e5ab16b607fa42ed6beb0'
-          target = Path(os.environ['RUNNER_TEMP'])/'reviewed-backend.patch'
-          target.write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', str(target)], check=True)
-          subprocess.run(['git', 'apply', str(target)], check=True)
-          PY
-      - name: Checkpoint the recovered source
+      - name: Align the merge regression with atomic per-file commits
         env:
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          git diff --check
+          mkdir -p test-results
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('internal/transfer/transfer_test.go')
+          text = p.read_text()
+          old = 'if err != nil || result.Verification != "same-machine-cp" {'
+          assert text.count(old) == 1
+          text = text.replace(old, 'if err != nil || result.Verification != "atomic-write" {')
+          text = text.replace('func TestNativeDirectoryCopyMergesContentsWithoutExtraSourceLayer', 'func TestAtomicDirectoryMergeKeepsContentsWithoutExtraSourceLayer')
+          p.write_text(text)
+          PY
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add internal/
-          git commit -m 'fix: integrate native job snapshots, durable lock history, PTY readiness and safe overwrite'
+          git add internal/transfer/transfer_test.go
+          git commit -m 'test: verify atomic directory merge without an extra source layer'
           git push origin "HEAD:refs/heads/$HEAD_BRANCH"
       - name: Race-test recovered application code
         shell: bash
