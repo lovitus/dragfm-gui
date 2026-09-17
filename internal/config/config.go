@@ -136,3 +136,22 @@ func (d *Document) SOCKSByID(id string) *SOCKSProxy {
 	}
 	return nil
 }
+
+// Clone detaches slices before a document is used outside its owner's lock.
+func (d Document) Clone() Document {
+	d.Hosts = append([]Host(nil), d.Hosts...)
+	for i := range d.Hosts {
+		d.Hosts[i].KeyIDs = append([]string(nil), d.Hosts[i].KeyIDs...)
+		d.Hosts[i].HopPasswords = append([]string(nil), d.Hosts[i].HopPasswords...)
+		d.Hosts[i].HopFingerprints = append([]string(nil), d.Hosts[i].HopFingerprints...)
+	}
+	d.Keys = append([]PrivateKey(nil), d.Keys...)
+	d.SOCKS = append([]SOCKSProxy(nil), d.SOCKS...)
+	d.Jumps = append([]JumpRoute(nil), d.Jumps...)
+	for i := range d.Jumps {
+		d.Jumps[i].HostIDs = append([]string(nil), d.Jumps[i].HostIDs...)
+	}
+	d.Relays = append([]RelaySuccess(nil), d.Relays...)
+	d.History = append([]HistoryEntry(nil), d.History...)
+	return d
+}

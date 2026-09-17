@@ -321,7 +321,7 @@ func (a *App) runJumpPool(ctx context.Context, operation transfer.Operation, pre
 		return errors.New("SSH 会话池仅用于两个 SSH 端点")
 	}
 	a.mu.RLock()
-	document := a.document
+	document := a.document.Clone()
 	sourceHost, sourceFound := document.HostByName(source.Name())
 	targetHost, targetFound := document.HostByName(target.Name())
 	if !sourceFound || !targetFound {

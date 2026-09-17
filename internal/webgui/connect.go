@@ -22,6 +22,11 @@ type routeCandidate struct {
 }
 
 func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName string) (*paneState, error) {
+	ctx, cancel, generation, err := a.activeContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	if !validPane(paneID) {
 		return nil, fmt.Errorf("未知文件栏 %q", paneID)
 	}
@@ -31,8 +36,10 @@ func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName 
 	a.mu.RLock()
 	current := a.panes[paneID]
 	if current != nil && current.endpoint != nil && current.name == name {
+		copy := *current
+		copy.generation = generation
 		a.mu.RUnlock()
-		return current, nil
+		return &copy, nil
 	}
 	if peerName == "" {
 		other := LeftPane
@@ -64,8 +71,13 @@ func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName 
 			return nil, err
 		}
 	}
-	state := &paneState{name: name, path: directory, endpoint: next}
+	state := &paneState{name: name, path: directory, endpoint: next, generation: generation}
 	a.mu.Lock()
+	if a.store == nil || a.locking || generation != a.generation {
+		a.mu.Unlock()
+		_ = next.Close()
+		return nil, context.Canceled
+	}
 	previous := a.panes[paneID]
 	a.panes[paneID] = state
 	if previous != nil && previous.endpoint != nil {
@@ -77,7 +89,8 @@ func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName 
 
 func (a *App) connectRemote(ctx context.Context, name, peerName string) (*endpoint.Remote, string, error) {
 	a.mu.RLock()
-	host, ok := a.document.HostByName(name)
+	document := a.document.Clone()
+	host, ok := document.HostByName(name)
 	a.mu.RUnlock()
 	if !ok || host.Disabled {
 		return nil, "", fmt.Errorf("未找到可用主机 %q", name)
@@ -166,7 +179,7 @@ func (a *App) routeCandidates(host config.Host, peerName string) ([]routeCandida
 			relayIDs = append(relayIDs, relayID)
 		}
 	}
-	document := a.document
+	document := a.document.Clone()
 	a.mu.RUnlock()
 	// Routine browsing never sprays the destination across the entire SOCKS
 	// pool. Only the host's explicit ###默认socks belongs in base; pool probing
@@ -190,7 +203,7 @@ func (a *App) routeCandidates(host config.Host, peerName string) ([]routeCandida
 
 func (a *App) routeForHost(host config.Host) (connector.Route, error) {
 	a.mu.RLock()
-	document := a.document
+	document := a.document.Clone()
 	runtimePasswords := make(map[int]string)
 	for index, value := range a.runtimePasswords[host.ID] {
 		runtimePasswords[index] = value
@@ -280,7 +293,7 @@ func (a *App) ask(ctx context.Context, challenge ChallengeModel) (challengeAnswe
 	challenge.ID = a.nextID("challenge")
 	response := make(chan challengeAnswer, 1)
 	a.mu.Lock()
-	if a.ctx == nil {
+	if a.locking || (a.ctx == nil && a.eventSink == nil) {
 		a.mu.Unlock()
 		return challengeAnswer{}, false
 	}

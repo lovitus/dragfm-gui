@@ -37,6 +37,9 @@ func (l *Local) Abs(_ context.Context, value string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		if value == "~" {
+			return home, nil
+		}
 		value = filepath.Join(home, strings.TrimPrefix(value, "~"+string(filepath.Separator)))
 	}
 	return filepath.Abs(value)

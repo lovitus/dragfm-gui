@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -67,6 +68,9 @@ func Run(ctx context.Context, operation Operation) (Result, error) {
 	if operation.SourcePath == "" || operation.TargetPath == "" {
 		return Result{}, errors.New("source and target paths are required")
 	}
+	if err := validateOperationPaths(ctx, operation); err != nil {
+		return Result{}, err
+	}
 	if operation.Move {
 		if result, done, err := tryNativeMove(ctx, operation); done {
 			return result, err
@@ -103,7 +107,9 @@ func Run(ctx context.Context, operation Operation) (Result, error) {
 			return Result{}, fmt.Errorf("copy %q: %w", item.Relative, err)
 		}
 	}
-	applyDirectoryMetadata(ctx, copyOperation, before.Items)
+	if err := applyDirectoryMetadata(ctx, copyOperation, before.Items); err != nil {
+		return Result{}, err
+	}
 	if stagedRoot != "" {
 		if err := commitStagedRoot(ctx, operation, stagedRoot, before.Items[0]); err != nil {
 			return Result{}, fmt.Errorf("commit staged root: %w", err)
@@ -140,7 +146,7 @@ func Run(ctx context.Context, operation Operation) (Result, error) {
 	return result, nil
 }
 
-func applyDirectoryMetadata(ctx context.Context, operation Operation, items []ManifestItem) {
+func applyDirectoryMetadata(ctx context.Context, operation Operation, items []ManifestItem) error {
 	ordered := orderedForCopy(items)
 	for index := len(ordered) - 1; index >= 0; index-- {
 		item := ordered[index]
@@ -148,9 +154,14 @@ func applyDirectoryMetadata(ctx context.Context, operation Operation, items []Ma
 			continue
 		}
 		target := targetPath(operation, item.Relative)
-		_ = operation.Destination.Chmod(ctx, target, item.Mode)
-		_ = operation.Destination.Chtimes(ctx, target, item.ModifiedTime(), item.ModifiedTime())
+		if err := operation.Destination.Chmod(ctx, target, item.Mode); err != nil {
+			return err
+		}
+		if err := operation.Destination.Chtimes(ctx, target, item.ModifiedTime(), item.ModifiedTime()); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func tryNativeCopy(ctx context.Context, operation Operation) (Result, bool, error) {
@@ -167,26 +178,32 @@ func tryNativeCopy(ctx context.Context, operation Operation) (Result, bool, erro
 	if err != nil {
 		return Result{}, true, err
 	}
-	merge := false
 	if targetInfo, statErr := operation.Destination.Stat(ctx, operation.TargetPath); statErr == nil {
 		if !operation.Overwrite {
 			return Result{}, true, fs.ErrExist
 		}
-		merge = sourceInfo.Mode.IsDir() && targetInfo.Mode.IsDir()
-		if !merge {
-			if err := operation.Destination.Remove(ctx, operation.TargetPath, targetInfo.Mode.IsDir()); err != nil {
-				return Result{}, true, err
-			}
+		// Directory merges need per-file atomic writers, not cp truncating the
+		// existing destination in place. Keep every old file until its copy is ready.
+		if sourceInfo.IsDir() && targetInfo.IsDir() {
+			return Result{}, false, nil
 		}
 	} else if !errors.Is(statErr, fs.ErrNotExist) {
 		return Result{}, true, statErr
 	}
+	staged, err := stagingPath(operation.TargetPath)
+	if err != nil {
+		return Result{}, true, err
+	}
+	defer operation.Source.Remove(context.Background(), staged, sourceInfo.IsDir())
 	emit(operation, Progress{Stage: "native-cp", Path: operation.SourcePath, Method: "cp"})
-	if err := copier.CopyNative(ctx, operation.SourcePath, operation.TargetPath, sourceInfo.Mode.IsDir(), merge); err != nil {
-		// A same-machine identity can still represent different users. If cp is
-		// denied, retain the controller-stream fallback which writes using the
-		// destination endpoint's credentials.
-		return Result{}, false, nil
+	if err := copier.CopyNative(ctx, operation.SourcePath, staged, sourceInfo.IsDir(), false); err != nil {
+		if ctx.Err() != nil {
+			return Result{}, true, ctx.Err()
+		}
+		return Result{}, false, nil // Different users may require destination-side writes.
+	}
+	if err := operation.Destination.Rename(ctx, staged, operation.TargetPath, operation.Overwrite); err != nil {
+		return Result{}, true, err
 	}
 	return Result{Copied: true, Files: 1, Bytes: sourceInfo.Size, Verification: "same-machine-cp"}, true, nil
 }
@@ -407,7 +424,10 @@ func CompareManifests(expected, actual Manifest, ignoreModified bool) error {
 func prepareRootCopy(ctx context.Context, operation Operation, root ManifestItem) (Operation, string, error) {
 	existing, err := operation.Destination.Stat(ctx, operation.TargetPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		staged := operation.TargetPath + ".dragfm-partial-" + fmt.Sprintf("%d", time.Now().UnixNano())
+		staged, stageErr := stagingPath(operation.TargetPath)
+		if stageErr != nil {
+			return Operation{}, "", stageErr
+		}
 		copy := operation
 		copy.TargetPath, copy.Overwrite = staged, false
 		return copy, staged, nil
@@ -421,28 +441,65 @@ func prepareRootCopy(ctx context.Context, operation Operation, root ManifestItem
 	if root.Mode.IsDir() && existing.Mode.IsDir() {
 		return operation, "", nil
 	}
-	staged := operation.TargetPath + ".dragfm-partial-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	staged, stageErr := stagingPath(operation.TargetPath)
+	if stageErr != nil {
+		return Operation{}, "", stageErr
+	}
 	copy := operation
 	copy.TargetPath, copy.Overwrite = staged, false
 	return copy, staged, nil
 }
 
 func commitStagedRoot(ctx context.Context, operation Operation, staged string, root ManifestItem) error {
-	if err := operation.Destination.Rename(ctx, staged, operation.TargetPath, operation.Overwrite); err == nil {
-		return nil
-	} else if !operation.Overwrite {
+	// A failed rename (permissions, cancellation, incompatible file types) is
+	// not permission to delete the old destination and retry destructively.
+	return operation.Destination.Rename(ctx, staged, operation.TargetPath, operation.Overwrite)
+}
+
+func stagingPath(target string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return target + ".dragfm-partial-" + hex.EncodeToString(nonce[:]), nil
+}
+
+func validateOperationPaths(ctx context.Context, operation Operation) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	existing, statErr := operation.Destination.Stat(ctx, operation.TargetPath)
-	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
-		return statErr
+	sourcePath, err := operation.Source.Abs(ctx, operation.SourcePath)
+	if err != nil {
+		return err
 	}
-	if statErr == nil {
-		if removeErr := operation.Destination.Remove(ctx, operation.TargetPath, existing.Mode.IsDir()); removeErr != nil {
-			return removeErr
+	targetPath, err := operation.Destination.Abs(ctx, operation.TargetPath)
+	if err != nil {
+		return err
+	}
+	if sourcePath != operation.SourcePath || targetPath != operation.TargetPath {
+		return errors.New("transfer paths must be absolute and normalized")
+	}
+	if operation.Source.Dir(sourcePath) == sourcePath || operation.Destination.Dir(targetPath) == targetPath {
+		return errors.New("refusing to transfer a filesystem root")
+	}
+	sourceID, sourceErr := operation.Source.Identity(ctx)
+	targetID, targetErr := operation.Destination.Identity(ctx)
+	if sourceErr != nil || targetErr != nil || sourceID.MachineID == "" || sourceID.MachineID != targetID.MachineID {
+		return nil
+	}
+	if sourcePath == targetPath {
+		return errors.New("source and destination are the same path")
+	}
+	// Endpoint-aware ancestry checks work with both POSIX and Windows paths.
+	for parent := operation.Destination.Dir(targetPath); ; parent = operation.Destination.Dir(parent) {
+		if parent == sourcePath {
+			return errors.New("destination is inside the source tree")
+		}
+		if parent == operation.Destination.Dir(parent) {
+			break
 		}
 	}
-	return operation.Destination.Rename(ctx, staged, operation.TargetPath, false)
+	return nil
 }
 
 func targetPath(operation Operation, relative string) string {

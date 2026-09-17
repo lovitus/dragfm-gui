@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	appconfig "github.com/lovitus/dragfm-gui/internal/config"
@@ -19,23 +20,35 @@ import (
 )
 
 type paneState struct {
-	name     string
-	path     string
-	endpoint endpoint.Endpoint
+	name       string
+	path       string
+	endpoint   endpoint.Endpoint
+	generation uint64
 }
 
 type terminalSession struct {
-	id      string
-	pane    PaneID
-	pty     endpoint.PTYSession
-	cancel  context.CancelFunc
-	writeMu sync.Mutex
+	id        string
+	pane      PaneID
+	pty       endpoint.PTYSession
+	cancel    context.CancelFunc
+	writeMu   sync.Mutex
+	startOnce sync.Once
+	endpoint  endpoint.Endpoint
+	ctx       context.Context
+	busy      atomic.Bool
 }
 
 type App struct {
-	ctx       context.Context
-	vaultPath string
-	queue     *jobs.Queue
+	ctx           context.Context
+	vaultPath     string
+	queue         *jobs.Queue
+	lifecycleMu   sync.Mutex
+	locking       bool
+	generation    uint64
+	sessionCtx    context.Context
+	sessionCancel context.CancelFunc
+	forwardDone   chan struct{}
+	eventSink     func(string, any) // Set only by in-package integration tests.
 
 	mu               sync.RWMutex
 	saveMu           sync.Mutex
@@ -57,27 +70,34 @@ func New(vaultPath string) *App {
 	app := &App{
 		vaultPath:        vaultPath,
 		queue:            jobs.New(128),
+		forwardDone:      make(chan struct{}),
 		panes:            make(map[PaneID]*paneState),
 		terminals:        make(map[string]*terminalSession),
 		challenges:       make(map[string]chan challengeAnswer),
 		runtimePasswords: make(map[string]map[int]string),
 		sessionSSH:       make(map[string]bool),
 	}
-	go app.forwardJobUpdates()
+	go app.forwardJobUpdates(app.queue, app.forwardDone)
 	return app
 }
 
-func (a *App) Startup(ctx context.Context) { a.ctx = ctx }
+func (a *App) Startup(ctx context.Context) { a.mu.Lock(); a.ctx = ctx; a.mu.Unlock() }
 
 func (a *App) Shutdown(context.Context) {
-	a.Lock()
-	a.queue.Close()
+	_ = a.Lock()
 }
 
 func (a *App) emit(name string, value any) {
 	a.mu.RLock()
-	ctx := a.ctx
+	ctx, sink, locking := a.ctx, a.eventSink, a.locking
 	a.mu.RUnlock()
+	if locking && name != "locked" {
+		return
+	}
+	if sink != nil {
+		sink(name, value)
+		return
+	}
 	if ctx != nil {
 		runtime.EventsEmit(ctx, name, value)
 	}
@@ -85,7 +105,7 @@ func (a *App) emit(name string, value any) {
 
 func (a *App) VaultStatus() (VaultStatusModel, error) {
 	a.mu.RLock()
-	unlocked := a.store != nil
+	unlocked := a.store != nil && !a.locking
 	a.mu.RUnlock()
 	header, err := vault.ReadHeader(a.vaultPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -98,6 +118,11 @@ func (a *App) VaultStatus() (VaultStatusModel, error) {
 }
 
 func (a *App) Unlock(password string) (BootstrapModel, error) {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	if a.isUnlocked() {
+		return a.Bootstrap()
+	}
 	if password == "" {
 		return BootstrapModel{}, errors.New("请输入主密码")
 	}
@@ -110,6 +135,8 @@ func (a *App) Unlock(password string) (BootstrapModel, error) {
 }
 
 func (a *App) CreateVault(hint, password, confirm string) (BootstrapModel, error) {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
 	if password != confirm {
 		return BootstrapModel{}, errors.New("两次输入的主密码不一致")
 	}
@@ -138,6 +165,14 @@ func (a *App) installVault(store *vault.Store, password []byte, document appconf
 		rightPath = home
 	}
 	a.mu.Lock()
+	if a.queue.Closed() {
+		a.queue = jobs.New(128)
+		a.forwardDone = make(chan struct{})
+		go a.forwardJobUpdates(a.queue, a.forwardDone)
+	}
+	a.generation++
+	a.locking = false
+	a.sessionCtx, a.sessionCancel = context.WithCancel(context.Background())
 	a.store = store
 	a.password = append(a.password[:0], password...)
 	a.document = document
@@ -149,7 +184,7 @@ func (a *App) installVault(store *vault.Store, password []byte, document appconf
 func (a *App) Bootstrap() (BootstrapModel, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.store == nil {
+	if a.store == nil || a.locking {
 		return BootstrapModel{}, errors.New("保险库尚未解锁")
 	}
 	hosts := []string{"本机"}
@@ -180,7 +215,7 @@ func (a *App) Bootstrap() (BootstrapModel, error) {
 	}
 	history := make([]HistoryEntryModel, 0, len(a.document.History))
 	for _, item := range a.document.History {
-		history = append(history, HistoryEntryModel{ID: item.ID, Operation: redact(item.Operation), Success: item.Success, Message: redact(item.Message), FinishedAt: timestamp(item.FinishedAt)})
+		history = append(history, HistoryEntryModel{ID: item.ID, Operation: a.redactKnownLocked(item.Operation), Success: item.Success, Message: a.redactKnownLocked(item.Message), FinishedAt: timestamp(item.FinishedAt)})
 	}
 	return BootstrapModel{Unlocked: true, Hosts: hosts, LeftEndpoint: leftEndpoint, RightEndpoint: rightEndpoint, LeftPath: leftPath, RightPath: rightPath, Theme: theme, History: history}, nil
 }
@@ -190,7 +225,7 @@ func (a *App) SetTheme(theme string) error {
 		return fmt.Errorf("未知主题 %q", theme)
 	}
 	a.mu.Lock()
-	if a.store == nil {
+	if a.store == nil || a.locking {
 		a.mu.Unlock()
 		return errors.New("保险库尚未解锁")
 	}
@@ -200,49 +235,88 @@ func (a *App) SetTheme(theme string) error {
 	return nil
 }
 
-func (a *App) Lock() {
-	a.queue.CancelAll()
-	_ = a.flushSave()
+// Lock cancels admission and work before persisting the final queue snapshot.
+// A fresh unlock gets a new queue; an old session can never write new history.
+func (a *App) Lock() error {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
 	a.mu.Lock()
-	if a.store == nil {
-		a.mu.Unlock()
-		return
+	a.locking = true
+	a.generation++
+	if a.sessionCancel != nil {
+		a.sessionCancel()
 	}
-	terminals := make([]*terminalSession, 0, len(a.terminals))
-	for _, session := range a.terminals {
-		terminals = append(terminals, session)
-	}
-	endpoints := make([]endpoint.Endpoint, 0, 2)
+	queue, forwardDone := a.queue, a.forwardDone
+	terminals, challenges := a.terminals, a.challenges
+	a.terminals = make(map[string]*terminalSession)
+	a.challenges = make(map[string]chan challengeAnswer)
+	var endpoints []endpoint.Endpoint
 	for _, pane := range a.panes {
 		if pane.endpoint != nil {
 			endpoints = append(endpoints, pane.endpoint)
 		}
 	}
 	endpoints = append(endpoints, a.retired...)
-	for index := range a.password {
-		a.password[index] = 0
-	}
-	a.password = nil
-	a.store = nil
-	a.document = appconfig.Document{}
-	a.panes = make(map[PaneID]*paneState)
-	a.retired = nil
-	a.terminals = make(map[string]*terminalSession)
-	a.runtimePasswords = make(map[string]map[int]string)
-	a.sessionSSH = make(map[string]bool)
 	a.mu.Unlock()
+	queue.Close()
+	for _, response := range challenges {
+		select {
+		case response <- challengeAnswer{}:
+		default:
+		}
+	}
 	for _, session := range terminals {
 		session.cancel()
 		_ = session.pty.Close()
 	}
-	seen := make(map[endpoint.Endpoint]bool)
-	for _, item := range endpoints {
-		if !seen[item] {
-			seen[item] = true
-			_ = item.Close()
+	closeEndpoints := func() {
+		seen := make(map[endpoint.Endpoint]bool)
+		for _, item := range endpoints {
+			if !seen[item] {
+				seen[item] = true
+				_ = item.Close()
+			}
 		}
 	}
+	var stopErr error
+	select {
+	case <-queue.Done():
+	case <-time.After(10 * time.Second):
+		// A stuck SFTP read may need its underlying connection closed.
+		closeEndpoints()
+		select {
+		case <-queue.Done():
+		case <-time.After(2 * time.Second):
+			stopErr = errors.New("任务取消超时；保险库已锁定，远端清理需检查")
+		}
+	}
+	if stopErr == nil {
+		select {
+		case <-forwardDone:
+		case <-time.After(time.Second):
+		}
+	}
+	for _, update := range queue.Snapshot() {
+		if update.State == jobs.Running || update.State == jobs.Pending {
+			update.State, update.FinishedAt, update.Message = jobs.Cancelled, time.Now(), "锁定时中断；请检查远端清理"
+		}
+		a.recordHistory(queue, update)
+	}
+	err := a.flushSave()
+	a.mu.Lock()
+	for index := range a.password {
+		a.password[index] = 0
+	}
+	a.password, a.store = nil, nil
+	a.document = appconfig.Document{}
+	a.panes = make(map[PaneID]*paneState)
+	a.retired = nil
+	a.runtimePasswords = make(map[string]map[int]string)
+	a.sessionSSH = make(map[string]bool)
+	a.mu.Unlock()
+	closeEndpoints()
 	a.emit("locked", map[string]any{})
+	return errors.Join(stopErr, err)
 }
 
 func (a *App) save() error {
@@ -276,7 +350,7 @@ func (a *App) requestSave() {
 		})
 		return
 	}
-	a.persistTimer.Reset(2 * time.Second)
+	// Keep the first deadline; activity must not postpone persistence forever.
 }
 
 func (a *App) flushSave() error {
@@ -295,20 +369,50 @@ func (a *App) flushSave() error {
 	return a.save()
 }
 
-func (a *App) forwardJobUpdates() {
-	for update := range a.queue.Updates() {
-		model := JobUpdateModel{ID: update.ID, State: string(update.State), Description: redact(update.Description), Message: redact(update.Message), Progress: update.Progress, ProgressKnown: update.ProgressKnown, Indeterminate: update.Indeterminate, Stage: update.Stage, Method: update.Method, BytesDone: update.BytesDone, BytesTotal: update.BytesTotal, FilesDone: update.FilesDone, FilesTotal: update.FilesTotal, StartedAt: timestamp(update.StartedAt), FinishedAt: timestamp(update.FinishedAt)}
-		a.emit("job:update", model)
+func (a *App) jobModel(update jobs.Update) JobUpdateModel {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.jobModelLocked(update)
+}
+
+func (a *App) jobModelLocked(update jobs.Update) JobUpdateModel {
+	return JobUpdateModel{ID: update.ID, Revision: update.Revision, State: string(update.State), Description: a.redactKnownLocked(update.Description), Message: a.redactKnownLocked(update.Message), Progress: update.Progress, ProgressKnown: update.ProgressKnown, Indeterminate: update.Indeterminate, Stage: update.Stage, Method: update.Method, BytesDone: update.BytesDone, BytesTotal: update.BytesTotal, FilesDone: update.FilesDone, FilesTotal: update.FilesTotal, StartedAt: timestamp(update.StartedAt), FinishedAt: timestamp(update.FinishedAt)}
+}
+
+func (a *App) recordHistory(queue *jobs.Queue, update jobs.Update) {
+	if update.State != jobs.Succeeded && update.State != jobs.Failed && update.State != jobs.Cancelled {
+		return
+	}
+	model := a.jobModel(update)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.store == nil || queue != a.queue {
+		return
+	}
+	for _, item := range a.document.History {
+		if item.ID == update.ID {
+			return
+		}
+	}
+	a.document.History = append(a.document.History, appconfig.HistoryEntry{ID: update.ID, StartedAt: update.StartedAt, FinishedAt: update.FinishedAt, Operation: model.Description, Success: update.State == jobs.Succeeded, Message: model.Message})
+	if len(a.document.History) > 500 {
+		a.document.History = append([]appconfig.HistoryEntry(nil), a.document.History[len(a.document.History)-500:]...)
+	}
+}
+
+func (a *App) forwardJobUpdates(queue *jobs.Queue, done chan struct{}) {
+	defer close(done)
+	for update := range queue.Updates() {
+		a.mu.RLock()
+		current := queue == a.queue
+		a.mu.RUnlock()
+		if !current {
+			continue
+		}
+		a.recordHistory(queue, update)
+		a.emit("job:update", a.jobModel(update))
 		if update.State == jobs.Succeeded || update.State == jobs.Failed || update.State == jobs.Cancelled {
-			a.mu.Lock()
-			if a.store != nil {
-				a.document.History = append(a.document.History, appconfig.HistoryEntry{ID: update.ID, StartedAt: update.StartedAt, FinishedAt: update.FinishedAt, Operation: redact(update.Description), Success: update.State == jobs.Succeeded, Message: redact(update.Message)})
-				if len(a.document.History) > 500 {
-					a.document.History = append([]appconfig.HistoryEntry(nil), a.document.History[len(a.document.History)-500:]...)
-				}
-			}
-			a.mu.Unlock()
-			_ = a.save()
+			a.requestSave()
 		}
 	}
 }
@@ -326,9 +430,14 @@ func (a *App) pane(value PaneID) (*paneState, error) {
 		return nil, fmt.Errorf("未知文件栏 %q", value)
 	}
 	a.mu.RLock()
+	if a.store == nil || a.locking {
+		a.mu.RUnlock()
+		return nil, errors.New("保险库尚未解锁")
+	}
 	pane := a.panes[value]
 	if pane != nil {
 		copy := *pane
+		copy.generation = a.generation
 		pane = &copy
 	}
 	a.mu.RUnlock()
@@ -351,7 +460,7 @@ var (
 	inlineCredentialPattern = regexp.MustCompile(`([[:alnum:]_.~%+-]+:)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s@]+)(@)`)
 	metadataSecretPattern   = regexp.MustCompile(`(?mi)^(###(?:sudo密码|root密码|口令)[ \t]*\r?\n)[^\r\n]+`)
 	assignmentSecretPattern = regexp.MustCompile(`(?i)(\b(?:password|passwd|passphrase|sudo_password|root_password)\s*[:=]\s*)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;]+)`)
-	privateKeyPattern       = regexp.MustCompile(`(?s)-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----.*?-----END (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----`)
+	privateKeyPattern       = regexp.MustCompile(`(?s)-----BEGIN (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----.*?-----END (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----`)
 )
 
 // redact preserves all whitespace and line boundaries while stripping every

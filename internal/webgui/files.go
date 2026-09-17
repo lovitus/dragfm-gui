@@ -1,7 +1,6 @@
 package webgui
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,7 +36,7 @@ func (a *App) List(paneID PaneID, endpointName, directory string) (DirectoryList
 	for _, item := range entries {
 		model = append(model, fileEntryModel(item))
 	}
-	a.updatePaneLocation(paneID, endpointName, abs)
+	a.updatePaneLocation(paneID, pane, abs)
 	return DirectoryListing{Pane: paneID, Endpoint: endpointName, Path: abs, Entries: model}, nil
 }
 
@@ -60,8 +59,14 @@ func fileEntryModel(item endpoint.Entry) FileEntryModel {
 	return FileEntryModel{Name: item.Name, Path: item.Path, Mode: item.Mode.String(), Size: item.Size, Modified: item.Modified.UTC().Format(time.RFC3339Nano), Directory: item.IsDir(), Symlink: item.Mode&fs.ModeSymlink != 0}
 }
 
-func (a *App) updatePaneLocation(paneID PaneID, endpointName, directory string) {
+func (a *App) updatePaneLocation(paneID PaneID, expected *paneState, directory string) {
 	a.mu.Lock()
+	current := a.panes[paneID]
+	if a.store == nil || a.locking || expected.generation != a.generation || current == nil || current.endpoint != expected.endpoint {
+		a.mu.Unlock()
+		return
+	}
+	endpointName := expected.name
 	if pane := a.panes[paneID]; pane != nil {
 		pane.name, pane.path = endpointName, directory
 	}
@@ -137,7 +142,7 @@ func (a *App) QueueTransfer(request TransferRequest) (string, error) {
 		verb = "移动"
 	}
 	description := fmt.Sprintf("%s · %s:%s → %s:%s", verb, source.name, request.SourcePath, destination.name, request.TargetPath)
-	return a.queue.Submit(jobs.Job{Description: description, Run: func(ctx context.Context, emit func(jobs.Update)) error {
+	return a.submitFor(source.generation, jobs.Job{Description: description, Run: func(ctx context.Context, emit func(jobs.Update)) error {
 		var knownBytes int64
 		var knownFiles int
 		operation := transfer.Operation{Source: source.endpoint, Destination: destination.endpoint, SourcePath: request.SourcePath, TargetPath: request.TargetPath, Move: request.Move, Overwrite: request.Overwrite, Progress: func(progress transfer.Progress) {
@@ -167,7 +172,7 @@ func (a *App) QueueTransfer(request TransferRequest) (string, error) {
 			if event.Error != nil {
 				message += " · " + event.Error.Error()
 			}
-			emit(jobs.Update{ProgressKnown: true, Progress: 0, Indeterminate: event.Stage == "running", Stage: event.Stage, Method: fmt.Sprintf("%s · %s · %s", event.Attempt.Tier, event.Attempt.Direction, event.Attempt.Method), BytesTotal: knownBytes, FilesTotal: knownFiles, Message: message})
+			emit(jobs.Update{ProgressKnown: false, Progress: 0, Indeterminate: true, Stage: event.Stage, Method: fmt.Sprintf("%s · %s · %s", event.Attempt.Tier, event.Attempt.Direction, event.Attempt.Method), BytesTotal: knownBytes, FilesTotal: knownFiles, Message: message})
 		})
 		if err == nil {
 			emit(jobs.Update{ProgressKnown: true, Progress: 1, Stage: "done", BytesDone: knownBytes, BytesTotal: knownBytes, FilesDone: knownFiles, FilesTotal: knownFiles, Message: fmt.Sprintf("传输完成 · %d 项 · %d bytes", knownFiles, knownBytes)})
@@ -188,7 +193,7 @@ func (a *App) QueueDelete(paneID PaneID, target string, recursive bool) (string,
 	if target == pane.endpoint.Dir(target) {
 		return "", errors.New("拒绝删除文件系统根目录")
 	}
-	return a.queue.Submit(jobs.Job{Description: "删除 · " + pane.name + ":" + target, Run: func(ctx context.Context, emit func(jobs.Update)) error {
+	return a.submitFor(pane.generation, jobs.Job{Description: "删除 · " + pane.name + ":" + target, Run: func(ctx context.Context, emit func(jobs.Update)) error {
 		return pane.endpoint.Remove(ctx, target, recursive)
 	}})
 }
@@ -202,7 +207,7 @@ func (a *App) QueueHash(paneID PaneID, target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return a.queue.Submit(jobs.Job{Description: "SHA-256 · " + pane.name + ":" + target, Run: func(ctx context.Context, emit func(jobs.Update)) error {
+	return a.submitFor(pane.generation, jobs.Job{Description: "SHA-256 · " + pane.name + ":" + target, Run: func(ctx context.Context, emit func(jobs.Update)) error {
 		manifest, err := transfer.Snapshot(ctx, pane.endpoint, target, true)
 		if err != nil {
 			return err
@@ -227,6 +232,12 @@ func (a *App) QueueCommand(target, command string) (string, error) {
 	if command == "" {
 		return "", errors.New("命令不能为空")
 	}
+	ctx, cancel, generation, err := a.activeContext(context.Background())
+	if err != nil {
+		return "", err
+	}
+	defer cancel()
+	_ = ctx
 	var selected endpoint.Endpoint
 	directory, name := "", target
 	switch target {
@@ -247,22 +258,28 @@ func (a *App) QueueCommand(target, command string) (string, error) {
 	default:
 		return "", fmt.Errorf("未知命令目标 %q", target)
 	}
-	return a.queue.Submit(jobs.Job{Description: "命令 · " + name, Run: func(ctx context.Context, emit func(jobs.Update)) error {
-		var output bytes.Buffer
+	return a.submitFor(generation, jobs.Job{Description: "命令 · " + name, Run: func(ctx context.Context, emit func(jobs.Update)) error {
+		var output commandOutput
 		err := selected.Exec(ctx, command, endpoint.ExecOptions{Directory: directory, Stdout: &output, Stderr: &output})
-		if output.Len() > 0 {
+		if output.String() != "" {
 			emit(jobs.Update{Message: output.String()})
 		}
 		return err
 	}})
 }
 
-func (a *App) CancelJob(id string) { a.queue.Cancel(id) }
+func (a *App) CancelJob(id string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.locking {
+		a.queue.Cancel(id)
+	}
+}
 
 func (a *App) GetConfigTexts() (ConfigTexts, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if a.store == nil {
+	if a.store == nil || a.locking {
 		return ConfigTexts{}, errors.New("保险库尚未解锁")
 	}
 	return ConfigTexts{Markdown: configtext.Markdown(a.document)}, nil
@@ -270,7 +287,12 @@ func (a *App) GetConfigTexts() (ConfigTexts, error) {
 
 func (a *App) SaveConfigTexts(markdown string) (BootstrapModel, error) {
 	a.mu.RLock()
-	old := a.document
+	if a.store == nil || a.locking {
+		a.mu.RUnlock()
+		return BootstrapModel{}, errors.New("保险库尚未解锁")
+	}
+	generation := a.generation
+	old := a.document.Clone()
 	a.mu.RUnlock()
 	hosts, privateKeys, proxies, err := configtext.ParseMarkdown(markdown, old)
 	if err != nil {
@@ -347,6 +369,10 @@ func (a *App) SaveConfigTexts(markdown string) (BootstrapModel, error) {
 		}
 	}
 	a.mu.Lock()
+	if a.store == nil || a.locking || generation != a.generation {
+		a.mu.Unlock()
+		return BootstrapModel{}, errors.New("会话已改变；未保存配置")
+	}
 	a.document.Hosts, a.document.SOCKS, a.document.Keys = hosts, proxies, privateKeys
 	a.mu.Unlock()
 	if err := a.save(); err != nil {

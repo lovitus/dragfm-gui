@@ -150,7 +150,10 @@ func TestLocalListAndDirectoryDropTarget(t *testing.T) {
 	}
 
 	app := New(filepath.Join(directory, "test.vault"))
-	defer app.queue.Close()
+	defer app.Lock()
+	if _, err := app.CreateVault("test hint", "test-password", "test-password"); err != nil {
+		t.Fatal(err)
+	}
 	app.mu.Lock()
 	app.panes[LeftPane] = &paneState{name: "本机", path: leftDirectory, endpoint: endpoint.NewLocal()}
 	app.panes[RightPane] = &paneState{name: "本机", path: rightDirectory, endpoint: endpoint.NewLocal()}

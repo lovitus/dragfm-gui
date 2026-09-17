@@ -29,16 +29,22 @@ func TestCloseWithoutEventConsumerRetainsFinalSnapshot(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	<-started
 	if _, err := q.Submit(Job{ID: "pending", Run: func(context.Context, func(Update)) error {
 		t.Error("pending job ran during shutdown")
 		return nil
-	}}); err != nil { t.Fatal(err) }
+	}}); err != nil {
+		t.Fatal(err)
+	}
 	q.Close()
 	awaitDone(t, q)
 	snapshot := q.Snapshot()
-	if len(snapshot) != 2 { t.Fatalf("snapshot=%+v", snapshot) }
+	if len(snapshot) != 2 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
 	for _, job := range snapshot {
 		if job.State != Cancelled || job.FinishedAt.IsZero() {
 			t.Fatalf("missing cancellation state: %+v", job)
@@ -63,21 +69,28 @@ func TestConcurrentSubmitCancelClose(t *testing.T) {
 					<-ctx.Done()
 					return ctx.Err()
 				}})
-				if err == nil { q.Cancel(id) }
+				if err == nil {
+					q.Cancel(id)
+				}
 			}(index)
 		}
 		q.Close()
 		callers.Wait()
 		awaitDone(t, q)
-		for range q.Updates() {}
+		for range q.Updates() {
+		}
 	}
 }
 
 func TestPanicIsFailedAndNextJobRuns(t *testing.T) {
 	q := New(4)
 	defer q.Close()
-	if _, err := q.Submit(Job{ID: "panic", Run: func(context.Context, func(Update)) error { panic("runner failure") }}); err != nil { t.Fatal(err) }
-	if _, err := q.Submit(Job{ID: "next", Run: func(context.Context, func(Update)) error { return nil }}); err != nil { t.Fatal(err) }
+	if _, err := q.Submit(Job{ID: "panic", Run: func(context.Context, func(Update)) error { panic("runner failure") }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Submit(Job{ID: "next", Run: func(context.Context, func(Update)) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.After(3 * time.Second)
 	var failed, succeeded bool
 	for !failed || !succeeded {
@@ -100,7 +113,9 @@ func TestConcurrentProgressAndDuplicateID(t *testing.T) {
 		<-release
 		return errors.New("expected failure")
 	}})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	<-started
 	if _, err := q.Submit(Job{ID: "copy", Run: func(context.Context, func(Update)) error { return nil }}); err == nil {
 		t.Fatal("duplicate active ID accepted")
@@ -119,13 +134,17 @@ func TestConcurrentProgressAndDuplicateID(t *testing.T) {
 		emit(Update{Message: "verified"})
 		return nil
 	}})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.After(3 * time.Second)
 	var revision uint64
 	for {
 		select {
 		case update := <-q.Updates():
-			if update.Revision <= revision { t.Fatalf("non-monotonic events: %+v", update) }
+			if update.Revision <= revision {
+				t.Fatalf("non-monotonic events: %+v", update)
+			}
 			revision = update.Revision
 			if update.ID == "concurrent" && update.State == Succeeded {
 				if update.BytesDone != 50 || update.BytesTotal != 100 || update.Stage != "copy" || update.Method != "stream" {

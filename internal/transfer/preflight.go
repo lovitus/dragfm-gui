@@ -44,6 +44,9 @@ func Preflight(ctx context.Context, operation Operation) (PreflightReport, error
 	if operation.Source == nil || operation.Destination == nil {
 		return PreflightReport{}, errors.New("transfer endpoints are required")
 	}
+	if err := validateOperationPaths(ctx, operation); err != nil {
+		return PreflightReport{}, err
+	}
 	sourcePath, err := operation.Source.Abs(ctx, operation.SourcePath)
 	if err != nil {
 		return PreflightReport{}, fmt.Errorf("resolve source path: %w", err)

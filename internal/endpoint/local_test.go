@@ -46,3 +46,14 @@ func TestLocalListDirectoriesFirst(t *testing.T) {
 		t.Fatalf("unexpected order: %#v", entries)
 	}
 }
+
+func TestLocalAbsBareTildeIsHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewLocal().Abs(context.Background(), "~")
+	if err != nil || got != home {
+		t.Fatalf("home=%q got=%q err=%v", home, got, err)
+	}
+}

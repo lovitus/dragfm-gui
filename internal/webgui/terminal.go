@@ -13,12 +13,18 @@ import (
 )
 
 func (a *App) StartTerminal(paneID PaneID, directory string, rows, columns int) (string, error) {
+	ctx, cancel, generation, err := a.activeContext(context.Background())
+	if err != nil {
+		return "", err
+	}
 	pane, err := a.pane(paneID)
 	if err != nil {
+		cancel()
 		return "", err
 	}
 	provider, ok := pane.endpoint.(endpoint.PTYProvider)
 	if !ok {
+		cancel()
 		return "", errors.New("当前端点不支持 PTY")
 	}
 	if rows < 2 {
@@ -30,25 +36,45 @@ func (a *App) StartTerminal(paneID PaneID, directory string, rows, columns int) 
 	if directory == "" {
 		directory = pane.path
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	pty, err := provider.OpenPTY(ctx, directory, a.endpointShell(pane.name), uint(rows), uint(columns))
 	if err != nil {
 		cancel()
 		return "", err
 	}
-	session := &terminalSession{id: a.nextID("terminal"), pane: paneID, pty: pty, cancel: cancel}
+	session := &terminalSession{id: a.nextID("terminal"), pane: paneID, pty: pty, cancel: cancel, ctx: ctx, endpoint: pane.endpoint}
 	a.mu.Lock()
+	current := a.panes[paneID]
+	if a.store == nil || a.locking || generation != a.generation || current == nil || current.endpoint != pane.endpoint {
+		a.mu.Unlock()
+		cancel()
+		_ = pty.Close()
+		return "", context.Canceled
+	}
+	var previousSessions []*terminalSession
 	for id, previous := range a.terminals {
 		if previous.pane == paneID {
 			delete(a.terminals, id)
-			previous.cancel()
-			_ = previous.pty.Close()
+			previousSessions = append(previousSessions, previous)
 		}
 	}
 	a.terminals[session.id] = session
 	a.mu.Unlock()
-	go a.pumpTerminal(session)
+	for _, previous := range previousSessions {
+		previous.cancel()
+		_ = previous.pty.Close()
+	}
+	// Do not emit the initial prompt before the frontend has received this ID
+	// and installed its session-specific event listener.
 	return session.id, nil
+}
+
+func (a *App) TerminalReady(sessionID string) error {
+	session, err := a.terminal(sessionID)
+	if err != nil {
+		return err
+	}
+	session.startOnce.Do(func() { go a.pumpTerminal(session) })
+	return nil
 }
 
 func (a *App) endpointShell(name string) string {
@@ -67,6 +93,9 @@ func (a *App) TerminalInput(sessionID, data string) error {
 	}
 	session.writeMu.Lock()
 	defer session.writeMu.Unlock()
+	if data != "" {
+		session.busy.Store(true)
+	}
 	_, err = io.WriteString(session.pty.Input(), data)
 	return err
 }
@@ -87,15 +116,17 @@ func (a *App) TerminalChangeDirectory(sessionID, directory string) error {
 	if err != nil {
 		return err
 	}
-	pane, err := a.pane(session.pane)
+	abs, err := session.endpoint.Abs(session.ctx, directory)
 	if err != nil {
 		return err
 	}
-	abs, err := pane.endpoint.Abs(context.Background(), directory)
-	if err != nil {
-		return err
+	session.writeMu.Lock()
+	defer session.writeMu.Unlock()
+	if !session.busy.CompareAndSwap(false, true) {
+		return errors.New("终端正在编辑输入或执行命令；未向程序注入 cd，请先返回 Shell 提示符")
 	}
-	return a.TerminalInput(sessionID, terminalCDCommand(abs))
+	_, err = io.WriteString(session.pty.Input(), terminalCDCommand(abs))
+	return err
 }
 
 func terminalCDCommand(directory string) string {
@@ -127,9 +158,15 @@ func (a *App) terminal(sessionID string) (*terminalSession, error) {
 }
 
 func (a *App) pumpTerminal(session *terminalSession) {
+	defer a.finishTerminal(session.id)
 	filtered := filterCWDMarkers(session.pty.Output(), func(directory string) {
+		session.busy.Store(false)
 		a.mu.Lock()
 		pane := a.panes[session.pane]
+		if a.store == nil || a.locking || a.terminals[session.id] != session || pane == nil || pane.endpoint != session.endpoint {
+			a.mu.Unlock()
+			return
+		}
 		if pane != nil {
 			pane.path = directory
 		}
@@ -139,8 +176,12 @@ func (a *App) pumpTerminal(session *terminalSession) {
 			a.document.UI.RightPath = directory
 		}
 		a.mu.Unlock()
+		a.requestSave()
 		a.emit("terminal:cwd", terminalCWDModel{Session: session.id, Pane: session.pane, Path: directory})
 	})
+	if closer, ok := filtered.(io.Closer); ok {
+		defer closer.Close()
+	}
 	chunks := make(chan []byte, 16)
 	go func() {
 		defer close(chunks)
@@ -148,7 +189,11 @@ func (a *App) pumpTerminal(session *terminalSession) {
 		for {
 			count, err := filtered.Read(buffer)
 			if count > 0 {
-				chunks <- append([]byte(nil), buffer[:count]...)
+				select {
+				case chunks <- append([]byte(nil), buffer[:count]...):
+				case <-session.ctx.Done():
+					return
+				}
 			}
 			if err != nil {
 				return
@@ -167,11 +212,14 @@ func (a *App) pumpTerminal(session *terminalSession) {
 	}
 	for {
 		select {
+		case <-session.ctx.Done():
+			return
 		case chunk, ok := <-chunks:
 			if !ok {
 				flush()
+				session.cancel()
+				_ = session.pty.Close()
 				_ = session.pty.Wait()
-				a.finishTerminal(session.id)
 				return
 			}
 			pending = append(pending, chunk...)
@@ -211,28 +259,43 @@ func filterCWDMarkers(source io.Reader, update func(string)) io.Reader {
 					if start < 0 {
 						keep := matchingPrefixSuffix(pending, prefix)
 						if len(pending) > keep {
-							_, _ = writer.Write(pending[:len(pending)-keep])
+							if _, writeErr := writer.Write(pending[:len(pending)-keep]); writeErr != nil {
+								return
+							}
 							pending = append([]byte(nil), pending[len(pending)-keep:]...)
 						}
 						break
 					}
 					end := bytes.IndexByte(pending[start+len(prefix):], 7)
 					if end < 0 {
+						if len(pending) > 64*1024 {
+							if _, writeErr := writer.Write(pending); writeErr != nil {
+								return
+							}
+							pending = pending[:0]
+							break
+						}
 						if start > 0 {
-							_, _ = writer.Write(pending[:start])
+							if _, writeErr := writer.Write(pending[:start]); writeErr != nil {
+								return
+							}
 							pending = append([]byte(nil), pending[start:]...)
 						}
 						break
 					}
 					end += start + len(prefix)
-					_, _ = writer.Write(pending[:start])
+					if _, writeErr := writer.Write(pending[:start]); writeErr != nil {
+						return
+					}
 					update(string(pending[start+len(prefix) : end]))
 					pending = append([]byte(nil), pending[end+1:]...)
 				}
 			}
 			if err != nil {
 				if len(pending) > 0 {
-					_, _ = writer.Write(pending)
+					if _, writeErr := writer.Write(pending); writeErr != nil {
+						return
+					}
 				}
 				if !errors.Is(err, io.EOF) {
 					_ = writer.CloseWithError(err)

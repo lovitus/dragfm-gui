@@ -74,7 +74,7 @@ func TestRemoteTransferMethodsOnPrivateRunners(t *testing.T) {
 	}
 	writeRemoteFile(t, ctx, source, source.Join(mergeSource, "new.txt"), "native-copy-new")
 	writeRemoteFile(t, ctx, source, source.Join(mergeTarget, "old.txt"), "native-copy-old")
-	if result, runErr := transfer.Run(ctx, transfer.Operation{Source: source, Destination: source, SourcePath: mergeSource, TargetPath: mergeTarget, Overwrite: true}); runErr != nil || result.Verification != "same-machine-cp" {
+	if result, runErr := transfer.Run(ctx, transfer.Operation{Source: source, Destination: source, SourcePath: mergeSource, TargetPath: mergeTarget, Overwrite: true}); runErr != nil || result.Verification != "atomic-write" {
 		t.Fatalf("same-machine directory copy: result=%#v err=%v", result, runErr)
 	}
 	assertRemoteFile(t, ctx, source, source.Join(mergeTarget, "new.txt"), "native-copy-new")
