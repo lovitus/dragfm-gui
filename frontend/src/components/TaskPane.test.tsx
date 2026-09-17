@@ -41,3 +41,10 @@ describe('TaskPane status ledger', () => {
     expect(formatBytes(24 * 1024 * 1024)).toBe('24.0 MiB')
   })
 })
+
+it('does not display a made-up zero percent when the method has no byte progress', () => {
+  render(<TaskPane jobs={[{ ...base, progressKnown: false, indeterminate: false }]} activity={[]} history={[]} activePane="left" onCommand={vi.fn()} onCancel={vi.fn()} />)
+  expect(screen.queryByText('0%')).not.toBeInTheDocument()
+  expect(screen.getByText('传输中')).toBeVisible()
+  cleanup()
+})

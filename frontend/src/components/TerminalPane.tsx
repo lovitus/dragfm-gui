@@ -14,6 +14,7 @@ function decodeBase64(value: string): Uint8Array {
 export default function TerminalPane({ pane, path, active, onCWD }: { pane: PaneID; path: string; active: boolean; onCWD: (path: string) => void }) {
   const host = useRef<HTMLDivElement>(null)
   const sessionRef = useRef('')
+  const reportErrorRef = useRef<(reason: unknown) => void>(() => {})
   const initialPath = useRef(path)
   const onCWDRef = useRef(onCWD)
   onCWDRef.current = onCWD
@@ -44,6 +45,8 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
         brightMagenta: '#d2a8ff', brightCyan: '#a5f3fc', brightWhite: '#f0f6fc',
       },
     })
+    const reportError = (reason: unknown) => { if (!disposed) terminal.writeln(`\r\n\x1b[31m${String(reason)}\x1b[0m`) }
+    reportErrorRef.current = reportError
     const fit = new FitAddon()
     terminal.loadAddon(fit)
     terminal.open(host.current)
@@ -51,7 +54,7 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
       requestAnimationFrame(() => {
         if (disposed || !host.current || host.current.clientWidth < 40 || host.current.clientHeight < 30) return
         fit.fit()
-        if (session) void api.terminalResize(session, terminal.rows, terminal.cols)
+        if (session) void api.terminalResize(session, terminal.rows, terminal.cols).catch(reportError)
       })
     })
     resize.observe(host.current)
@@ -67,21 +70,26 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
         onCWDRef.current(event.path)
       }
     })
-    const input = terminal.onData((data) => { if (session) void api.terminalInput(session, data) })
-    requestAnimationFrame(() => {
+    const input = terminal.onData((data) => { if (session) void api.terminalInput(session, data).catch(reportError) })
+    const startFrame = requestAnimationFrame(() => {
+      if (disposed) return
       fit.fit()
-      api.startTerminal(pane, path, terminal.rows, terminal.cols).then((id) => {
-        if (disposed) void api.closeTerminal(id)
+      api.startTerminal(pane, path, terminal.rows, terminal.cols).then(async (id) => {
+        if (disposed) await api.closeTerminal(id)
         else {
           session = id
           sessionRef.current = id
+          await api.terminalReady(id)
+          if (disposed) return
+          if (initialPath.current !== path) await api.terminalChangeDirectory(id, initialPath.current)
           if (activeRef.current) terminal.focus()
         }
-      }).catch((error) => terminal.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`))
+      }).catch(reportError)
     })
     return () => {
       disposed = true
-      if (session) void api.closeTerminal(session)
+      cancelAnimationFrame(startFrame)
+      if (session) void api.closeTerminal(session).catch(() => {})
       sessionRef.current = ''
       input.dispose()
       removeData()
@@ -97,7 +105,7 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
   useEffect(() => {
     if (path === initialPath.current) return
     initialPath.current = path
-    if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path)
+    if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => reportErrorRef.current(reason))
   }, [path])
 
   return <div className="terminal-host" ref={host} data-testid={`terminal-${pane}`} />

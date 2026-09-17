@@ -50,6 +50,7 @@ export interface TransferRequest extends DropPreview {
 }
 
 export interface JobUpdate {
+  revision?: number
   id: string
   state: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
   description: string

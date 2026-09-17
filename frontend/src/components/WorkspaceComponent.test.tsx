@@ -12,6 +12,7 @@ const { list, queueHash, queueDelete, prepareDrop } = vi.hoisted(() => ({
 vi.mock('../api', () => ({
   api: {
     list,
+    jobSnapshot: vi.fn(async () => []),
     changeEndpoint: vi.fn(),
     setTheme: vi.fn(),
     queueHash,

@@ -70,6 +70,7 @@ type TransferRequest struct {
 }
 
 type JobUpdateModel struct {
+	Revision      uint64  `json:"revision"`
 	ID            string  `json:"id"`
 	State         string  `json:"state"`
 	Description   string  `json:"description"`

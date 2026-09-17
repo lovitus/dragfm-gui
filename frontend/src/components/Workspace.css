@@ -1,0 +1,2 @@
+.operation-error { display: flex; align-items: center; gap: 1rem; padding: .6rem 1rem; border-bottom: 1px solid #dc6a6a; color: #df5353; overflow-wrap: anywhere; }
+.operation-error span { flex: 1; }

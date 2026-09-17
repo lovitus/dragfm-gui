@@ -33,7 +33,7 @@ export default function TaskPane({ jobs, activity, history, activePane, onComman
   activity: JobUpdate[]
   history: HistoryEntry[]
   activePane: 'left' | 'right'
-  onCommand: (target: string, command: string) => void
+  onCommand: (target: string, command: string) => Promise<boolean> | void
   onCancel: (id: string) => void
 }) {
   const [target, setTarget] = useState('当前焦点')
@@ -52,9 +52,9 @@ export default function TaskPane({ jobs, activity, history, activePane, onComman
     event.preventDefault()
     const value = command.trim()
     if (!value) return
-    onCommand(target === '当前焦点' ? activePane === 'left' ? '左栏' : '右栏' : target, value)
-    setCommand('')
+    void Promise.resolve(onCommand(target === '当前焦点' ? activePane === 'left' ? '左栏' : '右栏' : target, value)).then((success) => { if (success !== false) setCommand((current) => current.trim() === value ? '' : current) })
   }
+  const unknownProgress = Boolean(running && (running.indeterminate || !running.progressKnown))
   const percentage = running?.progressKnown ? Math.round(Math.max(0, Math.min(1, running.progress)) * 100) : 0
   const transferred = running?.bytesDone ? `${formatBytes(running.bytesDone)} / ` : ''
   return (
@@ -65,9 +65,9 @@ export default function TaskPane({ jobs, activity, history, activePane, onComman
       </header>
       <section className="running-block">
         <div className="running-line"><strong title={running?.description}>{running?.description || '没有运行中的任务'}</strong>{running && <button className="icon-button danger" title="取消任务" onClick={() => onCancel(running.id)}><Icon name="stop" /></button>}</div>
-        <div className={`progress-track ${running?.indeterminate ? 'indeterminate' : ''}`} aria-label={running ? running.indeterminate ? '传输正在进行，当前方法不提供字节进度' : `传输进度 ${percentage}%` : '没有运行中的任务'}><span style={{ width: running?.indeterminate ? '32%' : `${percentage}%` }} /></div>
+        <div className={`progress-track ${unknownProgress ? 'indeterminate' : ''}`} aria-label={running ? unknownProgress ? '传输正在进行，当前方法不提供字节进度' : `传输进度 ${percentage}%` : '没有运行中的任务'}><span style={{ width: unknownProgress ? '32%' : `${percentage}%` }} /></div>
         <div className="running-meta">
-          <strong>{running ? running.indeterminate ? '传输中' : `${percentage}%` : '—'}</strong>
+          <strong>{running ? unknownProgress ? '传输中' : `${percentage}%` : '—'}</strong>
           <span>{running?.bytesTotal ? `${transferred}${formatBytes(running.bytesTotal)}` : '等待传输统计'}</span>
           <span>{running?.filesTotal ? `${running.filesDone || 0} / ${running.filesTotal} 项` : ''}</span>
           <time>{running ? formatElapsed(running.startedAt, now) : '0:00'}</time>

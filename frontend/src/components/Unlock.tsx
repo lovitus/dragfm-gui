@@ -38,7 +38,7 @@ export default function Unlock({ status, busy, error, onUnlock, onCreate }: Prop
           {error && <div className="form-error"><Icon name="alert" />{error}</div>}
           <button className="primary-button unlock-button" type="submit" disabled={busy}>{busy ? '处理中…' : status.exists ? '解锁工作区' : '创建加密保险库'}</button>
         </form>
-        <footer>Argon2id · XChaCha20-Poly1305 · 凭据不会离开本机</footer>
+        <footer>Argon2id · XChaCha20-Poly1305 · 凭据加密保存</footer>
       </section>
     </main>
   )

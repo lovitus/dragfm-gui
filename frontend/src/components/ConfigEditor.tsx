@@ -92,7 +92,9 @@ function CodeEditor({ value, onChange, revealSecrets }: { value: string; onChang
         ],
       }),
     })
-    return () => { view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: '' } }); view.destroy() }
+    // A cleanup transaction would invoke onChange('') and erase the parent
+    // draft when toggling password visibility. Destroy without editing it.
+    return () => view.destroy()
     // Initial value is loaded once; subsequent edits belong to CodeMirror.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

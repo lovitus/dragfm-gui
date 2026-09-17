@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { api, onEvent } from '../api'
+import { isFinished, mergeJobUpdates } from '../jobState'
 import type { Bootstrap, DirectoryListing, DropPreview, FileEntry, HistoryEntry, JobUpdate, PaneID } from '../types'
 import type { PaneModel } from './FilePane'
 import FilePane, { isEditingTarget, parentPath } from './FilePane'
@@ -7,6 +8,7 @@ import TaskPane from './TaskPane'
 import ConfigEditor from './ConfigEditor'
 import Icon from './Icon'
 import Modal from './Modal'
+import './Workspace.css'
 
 function emptyListing(pane: PaneID, endpoint: string, path: string): DirectoryListing {
   return { pane, endpoint, path, entries: [] }
@@ -33,7 +35,7 @@ export function fileShortcut(event: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'alt
   return null
 }
 
-export default function Workspace({ initial, onLock }: { initial: Bootstrap; onLock: () => void }) {
+export default function Workspace({ initial, onLock, challengeOpen = false }: { initial: Bootstrap; onLock: () => void; challengeOpen?: boolean }) {
   const [bootstrap, setBootstrap] = useState(initial)
   const [activePane, setActivePane] = useState<PaneID>('left')
   const [models, setModels] = useState<Record<PaneID, PaneModel>>({
@@ -50,6 +52,14 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
   const [dropPreview, setDropPreview] = useState<DropPreview | null>(null)
   const [deleteEntry, setDeleteEntry] = useState<{ pane: PaneID; entry: FileEntry } | null>(null)
   const [settings, setSettings] = useState(false)
+  const [operationError, setOperationError] = useState('')
+  const dragCleanup = useRef<(() => void) | null>(null)
+  useEffect(() => () => dragCleanup.current?.(), [])
+  const runAction = useCallback(async (operation: () => Promise<unknown>): Promise<boolean> => {
+    setOperationError('')
+    try { await operation(); return true }
+    catch (reason) { setOperationError(String(reason)); return false }
+  }, [])
 
   const load = useCallback(async (pane: PaneID, path?: string, endpoint?: string) => {
     const current = modelsRef.current[pane]
@@ -70,7 +80,7 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
   useEffect(() => { void load('left'); void load('right') }, [load])
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
-      const modalOpen = settings || dropPreview !== null || deleteEntry !== null
+      const modalOpen = challengeOpen || settings || dropPreview !== null || deleteEntry !== null
       if (shouldNavigateOnBackspace(event, modalOpen)) {
         event.preventDefault()
         const current = modelsRef.current[activePane].listing.path
@@ -83,7 +93,7 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
       if (action && selected) {
         event.preventDefault()
         if (action === 'delete') setDeleteEntry({ pane: activePane, entry: selected })
-        else void api.queueHash(activePane, selected.path)
+        else void runAction(() => api.queueHash(activePane, selected.path))
         return
       }
       if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return
@@ -95,28 +105,49 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
         event.preventDefault()
         setBootstrap((current) => {
           const theme = current.theme === 'system' ? 'light' : current.theme === 'light' ? 'dark' : 'system'
-          void api.setTheme(theme)
+          void runAction(() => api.setTheme(theme))
           return { ...current, theme }
         })
       }
     }
     window.addEventListener('keydown', shortcut)
     return () => window.removeEventListener('keydown', shortcut)
-  }, [activePane, deleteEntry, dropPreview, load, onLock, settings])
-  useEffect(() => onEvent('job:update', (update) => {
-    const observed = { ...update, observedAt: new Date().toISOString() }
-    setActivity((old) => [...old.slice(-499), observed])
-    setJobs((old) => {
-      const index = old.findIndex((item) => item.id === update.id)
-      if (index < 0) return [...old, update]
-      const next = [...old]
-      next[index] = update
-      return next
-    })
-    if (['succeeded', 'failed', 'cancelled'].includes(update.state)) {
-      window.setTimeout(() => { void load('left'); void load('right') }, 80)
+  }, [activePane, challengeOpen, deleteEntry, dropPreview, load, onLock, runAction, settings])
+  useEffect(() => {
+    let disposed = false
+    let latest: JobUpdate[] = []
+    let refreshTimer: number | undefined
+    const apply = (updates: JobUpdate[]) => {
+      if (disposed) return
+      const old = new Map(latest.map((job) => [job.id, job]))
+      latest = mergeJobUpdates(latest, updates)
+      setJobs(latest)
+      const changes = latest.filter((job) => old.get(job.id) !== job)
+      if (changes.length) setActivity((activity) => [...activity, ...changes.map((job) => ({ ...job, observedAt: new Date().toISOString() }))].slice(-500))
+      if (changes.some((job) => isFinished(job) && !old.get(job.id)?.finishedAt)) {
+        window.clearTimeout(refreshTimer)
+        refreshTimer = window.setTimeout(() => { void load('left'); void load('right') }, 80)
+      }
     }
-  }), [load])
+    // Subscribe first; revision-aware merging closes the subscribe/snapshot race.
+    const unsubscribe = onEvent('job:update', (update) => apply([update]))
+    const reconcile = () => {
+      if (document.visibilityState === 'hidden') return
+      void api.jobSnapshot().then(apply).catch((reason) => { if (!disposed) setOperationError(String(reason)) })
+    }
+    reconcile()
+    const timer = window.setInterval(reconcile, 2000)
+    window.addEventListener('focus', reconcile)
+    document.addEventListener('visibilitychange', reconcile)
+    return () => {
+      disposed = true
+      unsubscribe()
+      window.clearInterval(timer)
+      window.clearTimeout(refreshTimer)
+      window.removeEventListener('focus', reconcile)
+      document.removeEventListener('visibilitychange', reconcile)
+    }
+  }, [load])
 
   const changeEndpoint = async (pane: PaneID, endpoint: string) => {
     const peer: PaneID = pane === 'left' ? 'right' : 'left'
@@ -135,6 +166,7 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
   const beginDrag = (event: ReactPointerEvent, pane: PaneID, entry: FileEntry) => {
     if (event.button !== 0) return
     event.preventDefault()
+    dragCleanup.current?.()
     document.getSelection()?.removeAllRanges()
     const startX = event.clientX, startY = event.clientY
     let started = false
@@ -155,12 +187,15 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
       window.removeEventListener('pointerup', up)
       window.removeEventListener('pointercancel', cancel)
       document.documentElement.classList.remove('dragging-files')
+      dragCleanup.current = null
       setDrag(null); setDropTarget(null)
       if (cancelled || !started || !latestTarget) return
-      void api.prepareDrop(pane, entry.path, latestTarget.pane, latestTarget.directory).then(setDropPreview)
+      const target = latestTarget
+      void runAction(async () => setDropPreview(await api.prepareDrop(pane, entry.path, target.pane, target.directory)))
     }
     const up = () => finish(false)
     const cancel = () => finish(true)
+    dragCleanup.current = cancel
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up, { once: true })
     window.addEventListener('pointercancel', cancel, { once: true })
@@ -169,8 +204,7 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
   const transfer = async (move: boolean) => {
     if (!dropPreview) return
     const request = { ...dropPreview, move, overwrite: dropPreview.conflict }
-    setDropPreview(null)
-    await api.queueTransfer(request)
+    if (await runAction(() => api.queueTransfer(request))) setDropPreview(null)
   }
   const currentHistory: HistoryEntry[] = jobs.filter((job) => ['succeeded', 'failed', 'cancelled'].includes(job.state)).map((job) => ({ id: job.id, operation: job.description, success: job.state === 'succeeded', message: job.message, finishedAt: job.finishedAt || '' }))
   const currentIDs = new Set(currentHistory.map((item) => item.id))
@@ -188,6 +222,7 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
           <button onClick={onLock}><Icon name="lock" />锁定</button>
         </div>
       </header>
+      {operationError && <div className="operation-error" role="alert"><span>{operationError}</span><button onClick={() => setOperationError('')} aria-label="关闭错误">关闭</button></div>}
       <main className="workspace-grid">
         {(['left', 'right'] as PaneID[]).map((pane) => <FilePane
           key={pane}
@@ -203,9 +238,9 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
           onSelect={(entry) => select(pane, entry)}
           onBeginDrag={beginDrag}
           onDelete={() => models[pane].selected && setDeleteEntry({ pane, entry: models[pane].selected! })}
-          onHash={() => models[pane].selected && void api.queueHash(pane, models[pane].selected!.path)}
+          onHash={() => models[pane].selected && void runAction(() => api.queueHash(pane, models[pane].selected!.path))}
         />)}
-        <TaskPane jobs={jobs} activity={activity} history={history} activePane={activePane} onCommand={(target, command) => void api.queueCommand(target, command)} onCancel={(id) => void api.cancelJob(id)} />
+        <TaskPane jobs={jobs} activity={activity} history={history} activePane={activePane} onCommand={(target, command) => runAction(() => api.queueCommand(target, command))} onCancel={(id) => void runAction(() => api.cancelJob(id))} />
       </main>
       {drag && <div className="drag-ghost" style={{ transform: `translate(${drag.x + 14}px, ${drag.y + 12}px)` }}><Icon name={drag.entry.directory ? 'folder' : 'file'} /><span>{drag.entry.name}</span>{dropTarget && <small>放入 {dropTarget.directory}</small>}</div>}
       {dropPreview && <Modal title={dropPreview.conflict ? '目标中已有同名项目' : '确认传输'} onClose={() => setDropPreview(null)}>
@@ -217,7 +252,7 @@ export default function Workspace({ initial, onLock }: { initial: Bootstrap; onL
       </Modal>}
       {deleteEntry && <Modal title="确认删除" onClose={() => setDeleteEntry(null)}>
         <div className="delete-confirm"><Icon name="trash" /><div><strong>{deleteEntry.entry.name}</strong><p>{deleteEntry.entry.path}</p></div></div>
-        <footer className="modal-footer"><span>删除任务将进入队列，并在完成后刷新两栏。</span><button className="secondary-button" onClick={() => setDeleteEntry(null)}>取消</button><button className="danger-button" onClick={() => { void api.queueDelete(deleteEntry.pane, deleteEntry.entry.path, deleteEntry.entry.directory); setDeleteEntry(null) }}>删除</button></footer>
+        <footer className="modal-footer"><span>删除任务将进入队列，并在完成后刷新两栏。</span><button className="secondary-button" onClick={() => setDeleteEntry(null)}>取消</button><button className="danger-button" onClick={() => { void runAction(() => api.queueDelete(deleteEntry.pane, deleteEntry.entry.path, deleteEntry.entry.directory)).then((success) => { if (success) setDeleteEntry(null) }) }}>删除</button></footer>
       </Modal>}
       {settings && <ConfigEditor onClose={() => setSettings(false)} onSaved={(next) => { setBootstrap(next); setSettings(false) }} />}
     </div>
