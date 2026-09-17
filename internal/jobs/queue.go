@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -28,6 +28,7 @@ type Job struct {
 type Update struct {
 	ID, Description, Message string
 	State                    State
+	Revision                 uint64
 	Progress                 float64
 	ProgressKnown            bool
 	Indeterminate            bool
@@ -38,17 +39,32 @@ type Update struct {
 	Error                    string
 }
 
+const historyLimit = 500
+const eventLimit = 1024
+
+// Queue has one worker and one event dispatcher. State changes never wait for
+// an event consumer, so an overloaded UI cannot prevent cancellation/shutdown.
+// Updates is a bounded, best-effort event stream; Snapshot is authoritative and
+// retains every active job and the latest 500 completed jobs. Revision permits
+// consumers to merge a snapshot with events without resurrecting stale jobs.
 type Queue struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	input     chan Job
-	updates   chan Update
-	mu        sync.Mutex
-	running   map[string]context.CancelFunc
-	pending   map[string]string
-	cancelled map[string]bool
-	sequence  atomic.Uint64
-	closed    bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	mu         sync.Mutex
+	capacity   int
+	pending    []Job
+	running    string
+	runCancel  context.CancelFunc
+	latest     map[string]Update
+	completed  []string
+	events     []Update
+	sequence   uint64
+	revision   uint64
+	closed     bool
+	wake       chan struct{}
+	eventWake  chan struct{}
+	workerDone chan struct{}
+	updates    chan Update
 }
 
 func New(buffer int) *Queue {
@@ -56,9 +72,21 @@ func New(buffer int) *Queue {
 		buffer = 64
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	queue := &Queue{ctx: ctx, cancel: cancel, input: make(chan Job, buffer), updates: make(chan Update, buffer*4), running: make(map[string]context.CancelFunc), pending: make(map[string]string), cancelled: make(map[string]bool)}
-	go queue.loop()
-	return queue
+	q := &Queue{
+		ctx: ctx, cancel: cancel, capacity: buffer, latest: make(map[string]Update),
+		wake: make(chan struct{}, 1), eventWake: make(chan struct{}, 1),
+		workerDone: make(chan struct{}), updates: make(chan Update, buffer*4),
+	}
+	go q.loop()
+	go q.dispatch()
+	return q
+}
+
+func signal(channel chan struct{}) {
+	select {
+	case channel <- struct{}{}:
+	default:
+	}
 }
 
 func (q *Queue) Submit(job Job) (string, error) {
@@ -70,140 +98,248 @@ func (q *Queue) Submit(job Job) (string, error) {
 	if job.Run == nil {
 		return "", errors.New("job has no runner")
 	}
-	if job.ID == "" {
-		job.ID = fmt.Sprintf("job-%d-%d", time.Now().Unix(), q.sequence.Add(1))
-	}
-	select {
-	case q.input <- job:
-		q.pending[job.ID] = job.Description
-		q.publish(Update{ID: job.ID, Description: job.Description, State: Pending})
-		return job.ID, nil
-	default:
+	if len(q.pending) >= q.capacity {
 		return "", errors.New("pending queue is full")
 	}
+	if job.ID == "" {
+		q.sequence++
+		job.ID = fmt.Sprintf("job-%d-%d", time.Now().UnixNano(), q.sequence)
+	}
+	if _, exists := q.latest[job.ID]; exists {
+		return "", fmt.Errorf("duplicate job ID %q", job.ID)
+	}
+	q.pending = append(q.pending, job)
+	q.recordLocked(Update{ID: job.ID, Description: job.Description, State: Pending})
+	signal(q.wake)
+	return job.ID, nil
 }
 
 func (q *Queue) Cancel(id string) bool {
 	q.mu.Lock()
-	cancel := q.running[id]
-	description, pending := q.pending[id]
-	if pending {
-		q.cancelled[id] = true
-		delete(q.pending, id)
-	}
-	q.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	defer q.mu.Unlock()
+	if q.running == id && q.runCancel != nil {
+		q.runCancel()
 		return true
 	}
-	if pending {
-		q.publish(Update{ID: id, Description: description, State: Cancelled, Message: "已取消", FinishedAt: time.Now()})
+	for index, job := range q.pending {
+		if job.ID == id {
+			q.pending = append(q.pending[:index], q.pending[index+1:]...)
+			q.recordLocked(cancelledUpdate(job))
+			return true
+		}
 	}
-	return pending
+	return false
+}
+
+func cancelledUpdate(job Job) Update {
+	return Update{ID: job.ID, Description: job.Description, State: Cancelled, Message: "已取消", FinishedAt: time.Now()}
+}
+
+func (q *Queue) cancelAllLocked() {
+	if q.runCancel != nil {
+		q.runCancel()
+	}
+	for _, job := range q.pending {
+		q.recordLocked(cancelledUpdate(job))
+	}
+	q.pending = nil
 }
 
 func (q *Queue) CancelAll() {
 	q.mu.Lock()
-	ids := make([]string, 0, len(q.pending)+len(q.running))
-	for id := range q.pending {
-		ids = append(ids, id)
-	}
-	for id := range q.running {
-		ids = append(ids, id)
-	}
-	q.mu.Unlock()
-	for _, id := range ids {
-		q.Cancel(id)
-	}
+	defer q.mu.Unlock()
+	q.cancelAllLocked()
 }
 
 func (q *Queue) Updates() <-chan Update { return q.updates }
 
+// Done closes after the running job has returned and its final state is in
+// Snapshot. Close is nonblocking; callers needing durable history must wait on
+// Done and persist Snapshot as well as consuming Updates.
+func (q *Queue) Done() <-chan struct{} { return q.workerDone }
+
+func (q *Queue) Closed() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed
+}
+
 func (q *Queue) Close() {
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	if q.closed {
-		q.mu.Unlock()
 		return
 	}
 	q.closed = true
-	q.mu.Unlock()
+	q.cancelAllLocked()
 	q.cancel()
+	signal(q.wake)
+}
+
+func (q *Queue) Snapshot() []Update {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	result := make([]Update, 0, len(q.latest))
+	for _, update := range q.latest {
+		result = append(result, update)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Revision < result[j].Revision })
+	return result
+}
+
+func (q *Queue) recordLocked(update Update) {
+	q.revision++
+	update.Revision = q.revision
+	q.latest[update.ID] = update
+	if update.State == Succeeded || update.State == Failed || update.State == Cancelled {
+		q.completed = append(q.completed, update.ID)
+		if len(q.completed) > historyLimit {
+			delete(q.latest, q.completed[0])
+			q.completed = q.completed[1:]
+		}
+	}
+	if len(q.events) == eventLimit {
+		// Keep memory bounded if the window is suspended. Snapshot repairs the
+		// view on resume; the worker and cancellation must remain responsive.
+		copy(q.events, q.events[1:])
+		q.events = q.events[:eventLimit-1]
+	}
+	q.events = append(q.events, update)
+	signal(q.eventWake)
 }
 
 func (q *Queue) loop() {
-	defer close(q.updates)
+	defer close(q.workerDone)
 	for {
-		select {
-		case <-q.ctx.Done():
-			return
-		case job := <-q.input:
-			q.mu.Lock()
-			cancelled := q.cancelled[job.ID]
-			delete(q.cancelled, job.ID)
-			delete(q.pending, job.ID)
+		q.mu.Lock()
+		if q.closed {
 			q.mu.Unlock()
-			if cancelled {
-				continue
-			}
-			q.execute(job)
+			return
 		}
+		if len(q.pending) == 0 {
+			q.mu.Unlock()
+			<-q.wake
+			continue
+		}
+		job := q.pending[0]
+		q.pending[0] = Job{}
+		q.pending = q.pending[1:]
+		ctx, cancel := context.WithCancel(q.ctx)
+		// Removal from Pending and registration as Running are atomic: Cancel
+		// can never fall into the gap between these states.
+		q.running, q.runCancel = job.ID, cancel
+		q.recordLocked(Update{ID: job.ID, Description: job.Description, State: Running,
+			Indeterminate: true, Stage: "starting", StartedAt: time.Now()})
+		q.mu.Unlock()
+		q.execute(ctx, job)
+		cancel()
 	}
 }
 
-func (q *Queue) execute(job Job) {
-	ctx, cancel := context.WithCancel(q.ctx)
-	q.mu.Lock()
-	q.running[job.ID] = cancel
-	q.mu.Unlock()
-	started := time.Now()
-	q.publish(Update{ID: job.ID, Description: job.Description, State: Running, Indeterminate: true, Stage: "starting", StartedAt: started})
-	lastMessage := ""
-	lastProgress := 0.0
-	progressKnown := false
+func (q *Queue) execute(ctx context.Context, job Job) {
 	emit := func(update Update) {
-		update.ID, update.Description = job.ID, job.Description
-		if update.State == "" {
-			update.State = Running
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		if q.running != job.ID {
+			return // Ignore a late callback after the runner has finished.
 		}
-		update.StartedAt = started
-		if update.Message != "" {
-			lastMessage = update.Message
+		last := q.latest[job.ID]
+		update.ID, update.Description, update.State = job.ID, job.Description, Running
+		update.StartedAt = last.StartedAt
+		if update.Message == "" {
+			update.Message = last.Message
 		}
-		if update.ProgressKnown {
-			lastProgress, progressKnown = update.Progress, true
-		} else if progressKnown {
-			update.Progress, update.ProgressKnown = lastProgress, true
+		if !update.ProgressKnown && !update.Indeterminate {
+			update.Progress, update.ProgressKnown, update.Indeterminate = last.Progress, last.ProgressKnown, last.Indeterminate
 		}
-		q.publish(update)
+		if update.Stage == "" {
+			update.Stage = last.Stage
+		}
+		if update.Method == "" {
+			update.Method = last.Method
+		}
+		if update.BytesDone == 0 && update.BytesTotal == 0 {
+			update.BytesDone, update.BytesTotal = last.BytesDone, last.BytesTotal
+		}
+		if update.FilesDone == 0 && update.FilesTotal == 0 {
+			update.FilesDone, update.FilesTotal = last.FilesDone, last.FilesTotal
+		}
+		q.recordLocked(update)
 	}
-	err := job.Run(ctx, emit)
-	cancel()
+	err := runSafely(ctx, job.Run, emit)
 	q.mu.Lock()
-	delete(q.running, job.ID)
-	q.mu.Unlock()
-	state := Succeeded
-	message := "完成"
-	if lastMessage != "" {
-		message = lastMessage
+	defer q.mu.Unlock()
+	final := q.latest[job.ID]
+	q.running, q.runCancel = "", nil
+	final.State, final.FinishedAt, final.Indeterminate = Succeeded, time.Now(), false
+	if final.Message == "" {
+		final.Message = "完成"
 	}
-	if errors.Is(err, context.Canceled) {
-		state, message = Cancelled, "已取消"
+	if errors.Is(err, context.Canceled) || (err != nil && ctx.Err() != nil) {
+		final.State, final.Message = Cancelled, "已取消"
 	} else if err != nil {
-		state, message = Failed, err.Error()
+		final.State, final.Message = Failed, err.Error()
 	}
-	update := Update{ID: job.ID, Description: job.Description, State: state, Message: message, StartedAt: started, FinishedAt: time.Now(), Progress: lastProgress, ProgressKnown: progressKnown}
-	if state == Succeeded {
-		update.Progress, update.ProgressKnown = 1, true
+	if final.State == Succeeded {
+		final.Progress, final.ProgressKnown = 1, true
 	}
 	if err != nil {
-		update.Error = err.Error()
+		final.Error = err.Error()
 	}
-	q.publish(update)
+	q.recordLocked(final)
 }
 
-func (q *Queue) publish(update Update) {
-	select {
-	case q.updates <- update:
-	case <-q.ctx.Done():
+func runSafely(ctx context.Context, run func(context.Context, func(Update)) error, emit func(Update)) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("job panicked: %v", value)
+		}
+	}()
+	return run(ctx, emit)
+}
+
+func (q *Queue) nextEvent() (Update, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.events) == 0 {
+		return Update{}, false
+	}
+	event := q.events[0]
+	q.events[0] = Update{}
+	q.events = q.events[1:]
+	return event, true
+}
+
+func (q *Queue) dispatch() {
+	defer close(q.updates) // Only this goroutine ever sends or closes Updates.
+	for {
+		if event, ok := q.nextEvent(); ok {
+			select {
+			case q.updates <- event:
+			case <-q.workerDone:
+				select {
+				case q.updates <- event:
+				default:
+					return // Complete final states remain available in Snapshot.
+				}
+			}
+			continue
+		}
+		select {
+		case <-q.eventWake:
+		case <-q.workerDone:
+			// The worker can have queued its last event after nextEvent.
+			for {
+				event, ok := q.nextEvent()
+				if !ok {
+					return
+				}
+				select {
+				case q.updates <- event:
+				default:
+					return
+				}
+			}
+		}
 	}
 }

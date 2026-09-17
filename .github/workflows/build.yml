@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   source:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +38,7 @@ jobs:
           retention-days: 7
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -52,20 +52,44 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Install Linux GUI headers
-        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+      - name: Prepare test reports
+        run: mkdir -p test-results
+      - name: Install native test dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgl1-mesa-dev xorg-dev xvfb libgtk-3-dev libwebkit2gtk-4.1-dev
       - name: Install frontend dependencies
         run: npm --prefix frontend ci
-      - name: Test Go packages
+      - name: Frontend dependency advisory report
+        shell: bash
         run: |
-          npm --prefix frontend run build
-          go test -mod=vendor ./...
-      - name: Vet Go packages
-        run: go vet -mod=vendor ./...
+          npm --prefix frontend audit --json > test-results/npm-audit.json || status=$?
+          test "${status:-0}" -le 1
       - name: Test frontend
-        run: npm --prefix frontend test -- --run
-      - name: Build frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix frontend test -- --run 2>&1 | tee test-results/frontend.log
+      - name: Build production frontend
         run: npm --prefix frontend run build
+      - name: Test all Go packages using the supported X11 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          xvfb-run -a go test -mod=vendor -tags=x11,webkit2_41 -count=1 -timeout=5m -json ./... | tee test-results/go-unit.jsonl
+      - name: Race-test application packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          xvfb-run -a go test -mod=vendor -tags=x11,webkit2_41 -race -count=1 -timeout=5m -json ./internal/... | tee test-results/go-race.jsonl
+      - name: Vet all Go packages
+        run: go vet -mod=vendor -tags=x11,webkit2_41 ./...
+      - name: Retain test evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-test-results
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 14
 
   build-macos-arm64:
     needs: test
