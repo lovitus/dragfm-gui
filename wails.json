@@ -1,0 +1,12 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "dragfm",
+  "outputfilename": "dragfm-gui",
+  "frontend:install": "npm --prefix frontend install",
+  "frontend:build": "npm --prefix frontend run build",
+  "frontend:dev:watcher": "npm --prefix frontend run dev -- --host 127.0.0.1",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "dragfm contributors"
+  }
+}

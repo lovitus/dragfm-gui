@@ -1,0 +1,60 @@
+name: validate-and-build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install Linux GUI headers
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev wayland-protocols
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+      - name: Test Go packages
+        run: |
+          npm --prefix frontend run build
+          go test -mod=vendor ./...
+      - name: Vet Go packages
+        run: go vet -mod=vendor ./...
+      - name: Test frontend
+        run: npm --prefix frontend test -- --run
+      - name: Build frontend
+        run: npm --prefix frontend run build
+
+  build-macos-arm64:
+    needs: test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
+      - run: ./build/build-wails-macos.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-macos-arm64
+          path: |
+            dist/dragfm-gui-wails-darwin-arm64
+            dist/SHA256SUMS.wails
+          if-no-files-found: error

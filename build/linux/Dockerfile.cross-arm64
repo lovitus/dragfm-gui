@@ -1,0 +1,37 @@
+ARG GO_IMAGE=golang:1.26-bookworm
+ARG BASE_IMAGE=${GO_IMAGE}
+FROM ${GO_IMAGE} AS go_toolchain
+
+FROM ${BASE_IMAGE} AS build
+COPY --from=go_toolchain /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH
+
+ARG APT_MIRROR=
+RUN if [ -n "${APT_MIRROR}" ]; then \
+      if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i "s|http://deb.debian.org/debian-security|${APT_MIRROR}/debian-security|g; s|http://deb.debian.org/debian|${APT_MIRROR}/debian|g" /etc/apt/sources.list.d/debian.sources; \
+      elif [ -f /etc/apt/sources.list ]; then \
+        sed -i "s|http://deb.debian.org/debian-security|${APT_MIRROR}/debian-security|g; s|http://security.debian.org/debian-security|${APT_MIRROR}/debian-security|g; s|http://deb.debian.org/debian|${APT_MIRROR}/debian|g" /etc/apt/sources.list; \
+      fi; \
+    fi \
+    && dpkg --add-architecture arm64 \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config \
+      libgl1-mesa-dev:arm64 libx11-dev:arm64 \
+      libx11-xcb-dev:arm64 libxcursor-dev:arm64 libxfixes-dev:arm64 \
+      libxi-dev:arm64 libxinerama-dev:arm64 libxkbcommon-dev:arm64 \
+      libxrandr-dev:arm64 libxrender-dev:arm64 libxxf86vm-dev:arm64 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+ENV CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ \
+    PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
+    PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -tags x11 -mod=vendor -buildvcs=false \
+    -trimpath -ldflags="-s -w" -o /out/dragfm-gui-linux-arm64 ./cmd/dragfm-gui
+
+FROM scratch AS export
+COPY --from=build /out/ /
