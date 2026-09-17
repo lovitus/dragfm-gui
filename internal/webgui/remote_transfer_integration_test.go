@@ -25,13 +25,13 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func TestRemoteTransferMethodsOnPrivateRunners(t *testing.T) {
+func TestRemoteTransferMethodsOnHostedFixtures(t *testing.T) {
 	sourceTarget := os.Getenv("DRAGFM_E2E_SOURCE_SSH")
 	targetTarget := os.Getenv("DRAGFM_E2E_TARGET_SSH")
 	if sourceTarget == "" || targetTarget == "" {
-		t.Skip("private SSH integration targets are not configured")
+		t.Skip("disposable SSH integration targets are not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
 	sourceRoute, sourceKeys := openSSHRoute(t, sourceTarget)
@@ -53,6 +53,7 @@ func TestRemoteTransferMethodsOnPrivateRunners(t *testing.T) {
 	defer target.Remove(context.Background(), targetRoot, true)
 
 	app := New(filepath.Join(t.TempDir(), "unused.vault"))
+	defer app.Lock()
 	document := config.NewDocument()
 	document.Keys = append(document.Keys, sourceKeys...)
 	document.Keys = append(document.Keys, targetKeys...)
@@ -62,8 +63,6 @@ func TestRemoteTransferMethodsOnPrivateRunners(t *testing.T) {
 	}
 	app.document = document
 
-	// Same-machine paths must stay native and absolute even when the endpoint is
-	// SSH-backed. Cover cp directory merge and mv before any cross-host route.
 	mergeSource := source.Join(sourceRoot, "same-merge-source")
 	mergeTarget := source.Join(sourceRoot, "same-merge-target")
 	if err := source.MkdirAll(ctx, mergeSource, 0750); err != nil {
@@ -92,7 +91,7 @@ func TestRemoteTransferMethodsOnPrivateRunners(t *testing.T) {
 	pushPreflight := mustPreflight(t, ctx, push)
 	t.Logf("capabilities source=%q target=%q source-tools=%v target-tools=%v", pushPreflight.SourceCapabilities.Architecture, pushPreflight.TargetCapabilities.Architecture, pushPreflight.SourceCapabilities.Tools, pushPreflight.TargetCapabilities.Tools)
 	if pushPreflight.SameMachine {
-		t.Fatal("private runner integration endpoints unexpectedly have the same machine identity")
+		t.Fatal("hosted integration endpoints unexpectedly have the same machine identity")
 	}
 	if err := app.runAgentMethod(ctx, push, pushPreflight, strategy.SourcePush, false, "", nil, nil, strategy.SCP); err != nil {
 		t.Fatalf("source push SCP: %v", err)
@@ -233,7 +232,11 @@ func TestRemoteTransferMethodsOnPrivateRunners(t *testing.T) {
 
 func openSSHRoute(t *testing.T, target string) (connector.Route, []config.PrivateKey) {
 	t.Helper()
-	output, err := exec.Command("ssh", "-G", target).Output()
+	args := []string{"-G", target}
+	if configPath := os.Getenv("DRAGFM_E2E_SSH_CONFIG"); configPath != "" {
+		args = append([]string{"-F", configPath}, args...)
+	}
+	output, err := exec.Command("ssh", args...).Output()
 	if err != nil {
 		t.Fatalf("resolve OpenSSH target: %v", err)
 	}
