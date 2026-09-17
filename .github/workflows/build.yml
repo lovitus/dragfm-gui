@@ -2,17 +2,48 @@ name: validate-and-build
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  source:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive the exact tracked source and record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source"
+          git archive --format=tar.gz --prefix=dragfm-gui/ HEAD > "$RUNNER_TEMP/source/dragfm-gui-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/source/COMMIT.txt"
+          cd "$RUNNER_TEMP/source"
+          sha256sum dragfm-gui-source.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-source
+          path: ${{ runner.temp }}/source/
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
@@ -39,8 +70,11 @@ jobs:
   build-macos-arm64:
     needs: test
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
