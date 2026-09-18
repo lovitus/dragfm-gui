@@ -1,0 +1,125 @@
+name: finalize-hans-review
+on:
+  pull_request:
+    paths: ['.github/workflows/finalize-hans-review.yml']
+permissions:
+  contents: read
+jobs:
+  finalize:
+    if: github.event.pull_request.number == 1 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Finalize reviewed extraction and call sites
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('internal/agentservice/service.go')
+          s = p.read_text()
+          old = 'type processJob struct {\n\tcommand *exec.Cmd\n\tdone    chan error\n}\n\n'
+          assert s.count(old) == 1
+          s = s.replace(old, '')
+          start, end = s.index('func (s *Service) startHans('), s.index('func tcpProbe(')
+          assert start < end
+          s = s[:start] + s[end:]
+          s = s.replace('case "process-stop":', 'case "process-diagnostics":\n\t\tresponse.Values["output"], err = s.processDiagnostics(request.Options["job"])\n\tcase "process-status":\n\t\terr = s.processStatus(request.Options["job"])\n\tcase "socks-tcp-probe":\n\t\terr = probeSOCKSTCP(s.ctx, request.Options["proxy"], request.Options["target"])\n\tcase "process-stop":')
+          p.write_text(s)
+          p = Path('internal/remoteagent/remoteagent.go')
+          s = p.read_text()
+          pos = s.index('func (s *Session) StopProcess(')
+          s = s[:pos] + '''func (s *Session) ProcessDiagnostics(ctx context.Context, job string) (string, error) {
+           response, err := s.CallContext(ctx, "process-diagnostics", map[string]string{"job": job}, nil)
+           return response.Values["output"], err
+          }
+          func (s *Session) ProcessStatus(ctx context.Context, job string) error {
+           _, err := s.CallContext(ctx, "process-status", map[string]string{"job": job}, nil)
+           return err
+          }
+          func (s *Session) ProbeSOCKSTCP(ctx context.Context, proxyAddress, targetAddress string) error {
+           _, err := s.CallContext(ctx, "socks-tcp-probe", map[string]string{"proxy": proxyAddress, "target": targetAddress}, nil)
+           return err
+          }
+          ''' + s[pos:]
+          p.write_text(s)
+          p = Path('internal/webgui/transfer_attempts.go')
+          s = p.read_text()
+          old = '\tnetwork := randomHansNetwork()'
+          assert s.count(old) == 1
+          s = s.replace(old, ''' a.mu.RLock()
+           serverHost, hostExists := a.document.HostByName(server.Name())
+           a.mu.RUnlock()
+           if !hostExists { return errors.New("Hans server configuration is missing") }
+           serverRoute, err := a.routeForHost(serverHost)
+           if err != nil { return err }
+           if len(serverRoute.Hops) == 0 { return errors.New("Hans server SSH route is empty") }
+           serverPort := serverRoute.Hops[len(serverRoute.Hops)-1].Port
+           if serverPort == 0 { serverPort = 22 }
+           network := randomHansNetwork()''')
+          old = 'waitForHansSOCKS(ctx, clientAgent, socksAddress)'
+          assert s.count(old) == 1
+          s = s.replace(old, 'waitForHansSOCKS(ctx, clientAgent, socksAddress, net.JoinHostPort(serverTunnelIP, fmt.Sprint(serverPort)), serverAgent, serverJob, clientJob)')
+          old = '\t\t\tif err != nil {\n\t\t\t\ttransferFailures = append(transferFailures, fmt.Errorf("%s/elevated=%t: %w", method, elevated, err))'
+          assert s.count(old) == 1
+          s = s.replace(old, '''   if err != nil {
+              if !transfer.Retryable(err) {
+               if cleanupTransferAgent != nil { cleanupTransferAgent() }
+               return err
+              }
+              transferFailures = append(transferFailures, fmt.Errorf("%s/elevated=%t: %w", method, elevated, err))''')
+          start, end = s.index('func waitForHansSOCKS('), s.index('func randomHansNetwork(')
+          assert start < end
+          s = s[:start] + '''// Require an actual TCP CONNECT through the authenticated v5 tunnel,
+          // not merely a listening SOCKS socket. Retain bounded redacted diagnostics.
+          func waitForHansSOCKS(ctx context.Context, client *remoteagent.Session, proxyAddress, targetAddress string, server *remoteagent.Session, serverJob, clientJob string) error {
+           var last error
+           deadline := time.Now().Add(20 * time.Second)
+           for time.Now().Before(deadline) {
+            if err := ctx.Err(); err != nil { return err }
+            if err := server.ProcessStatus(ctx, serverJob); err != nil { return fmt.Errorf("Hans server: %w", err) }
+            if err := client.ProcessStatus(ctx, clientJob); err != nil { return fmt.Errorf("Hans client: %w", err) }
+            if err := client.ProbeSOCKSTCP(ctx, proxyAddress, targetAddress); err == nil { return nil } else { last = err }
+            timer := time.NewTimer(250 * time.Millisecond)
+            select { case <-ctx.Done(): timer.Stop(); return ctx.Err(); case <-timer.C: }
+           }
+           serverLog, _ := server.ProcessDiagnostics(ctx, serverJob)
+           clientLog, _ := client.ProcessDiagnostics(ctx, clientJob)
+           return fmt.Errorf("Hans tunnel TCP readiness failed: %w; server: %s; client: %s", last, serverLog, clientLog)
+          }
+          
+          ''' + s[end:]
+          p.write_text(s)
+          p = Path('internal/webgui/hosted_ssh_integration_test.go')
+          s = p.read_text()
+          old = 'go func() { _ = app.ResolveChallenge(challenge.ID, accepted, "", false) }()'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'go app.ResolveChallenge(challenge.ID, accepted, "", false)'))
+          p = Path('internal/agentservice/hans_integration_test.go')
+          s = p.read_text()
+          old = 't.Fatalf("official Hans userspace tunnel did not carry TCP: %v", lastErr)'
+          assert s.count(old) == 1
+          s = s.replace(old, '''for _, child := range []struct{ service *agentservice.Service; job string }{{server, serverJob}, {client, clientJob}} {
+           reply := child.service.Handle(agentproto.Request{Version: agentproto.ProtocolVersion, ID: "diagnose", Action: "process-diagnostics", Options: map[string]string{"job": child.job}})
+           t.Logf("%s: %s", child.job, reply.Values["output"])
+          }
+          t.Fatalf("official Hans userspace tunnel did not carry TCP: %v", lastErr)''')
+          p.write_text(s)
+      - name: Format and commit extracted source
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          gofmt -w internal/agentservice/service.go internal/remoteagent/remoteagent.go internal/webgui/transfer_attempts.go internal/webgui/hosted_ssh_integration_test.go internal/agentservice/hans_integration_test.go
+          git diff --check
+          git add internal/agentservice/service.go internal/remoteagent/remoteagent.go internal/webgui/transfer_attempts.go internal/webgui/hosted_ssh_integration_test.go internal/agentservice/hans_integration_test.go
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(hans): require tunnel TCP readiness and report bounded child diagnostics'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
