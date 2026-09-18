@@ -171,7 +171,7 @@
       await complete(failed.id, 'failed');
       const running = await queueCommand('sleep 30; printf running-should-not-finish');
       await wait('command running', async () => (await api.JobSnapshot()).some((job) => job.id === running.id && job.state === 'running'));
-      document.querySelector('.running-line button').click();
+      (await wait('running cancellation control rendered', () => document.querySelector('.running-line button'))).click();
       await complete(running.id, 'cancelled');
       checks.push('native pending/running cancellation and failed SSH command');
       await drag('second.txt', '移动并覆盖').then((job) => complete(job.id));
