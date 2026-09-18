@@ -56,7 +56,7 @@ describe('Workspace refresh integration', () => {
   it('refreshes the pane after every terminal prompt even when cwd is unchanged', async () => {
     render(<Workspace initial={initial} onLock={() => {}} />)
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2))
-    fireEvent.click(screen.getByTestId('prompt-left'))
+    fireEvent.click(await screen.findByTestId('prompt-left'))
     await waitFor(() => expect(list).toHaveBeenCalledTimes(3))
     expect(list).toHaveBeenLastCalledWith('left', '本机', '/left')
   })
