@@ -45,6 +45,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
   const modelsRef = useRef(models)
   modelsRef.current = models
   const revisions = useRef<Record<PaneID, number>>({ left: 0, right: 0 })
+  const listingInFlight = useRef<Record<PaneID, boolean>>({ left: false, right: false })
   const [jobs, setJobs] = useState<JobUpdate[]>([])
   const [activity, setActivity] = useState<JobUpdate[]>([])
   const [drag, setDrag] = useState<DragState | null>(null)
@@ -62,6 +63,10 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
   }, [])
 
   const load = useCallback(async (pane: PaneID, path?: string, endpoint?: string) => {
+    // A completion refresh must not replace a newer user navigation with
+    // the old, still-rendered directory while its request is in flight.
+    if (path === undefined && endpoint === undefined && listingInFlight.current[pane]) return
+    listingInFlight.current[pane] = true
     const current = modelsRef.current[pane]
     const revision = ++revisions.current[pane]
     const requestedPath = path || current.listing.path
@@ -74,6 +79,8 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     } catch (reason) {
       if (revision !== revisions.current[pane]) return
       setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: false, error: String(reason) } }))
+    } finally {
+      if (revision === revisions.current[pane]) listingInFlight.current[pane] = false
     }
   }, [])
 
@@ -150,6 +157,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
   }, [load])
 
   const changeEndpoint = async (pane: PaneID, endpoint: string) => {
+    listingInFlight.current[pane] = true
     const peer: PaneID = pane === 'left' ? 'right' : 'left'
     const revision = ++revisions.current[pane]
     setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: true, error: '' } }))
@@ -160,6 +168,8 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     } catch (reason) {
       if (revision !== revisions.current[pane]) return
       setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: false, error: String(reason) } }))
+    } finally {
+      if (revision === revisions.current[pane]) listingInFlight.current[pane] = false
     }
   }
 

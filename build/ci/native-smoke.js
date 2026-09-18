@@ -183,6 +183,7 @@
       await wait('unselected refreshed file list', () => !pane('left').querySelector('.loading-line') && !pane('left').querySelector('.selected'));
       pane('left').querySelector('.file-viewport').focus();
       pane('left').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      await wait('left pane focused', () => pane('left').classList.contains('active'));
       key(pane('left').querySelector('.file-viewport'), 'Backspace', 8);
       await wait('Backspace without selection', () => pathInput('left').value === plan.parent);
       await wait('Backspace shell synchronized', () => cwd.left.path === plan.parent);
@@ -190,11 +191,14 @@
       checks.push('Backspace navigates with no selected row');
       const hashRow = await wait('hashable file', () => row('left', 'hash.txt'));
       hashRow.click();
+      await wait('hash row selected', () => hashRow.classList.contains('selected'));
       key(hashRow, 'h', 72);
       await wait('SHA-256 hotkey output', async () => (await api.JobSnapshot()).some((job) => job.state === 'succeeded' && job.message.includes(plan.hash)));
       checks.push('native h hotkey returns real SHA-256');
       const removeRow = await wait('deletable file', () => row('left', 'delete.txt'));
-      removeRow.click(); key(removeRow, 'd', 68);
+      removeRow.click();
+      await wait('delete row selected', () => removeRow.classList.contains('selected'));
+      key(removeRow, 'd', 68);
       await wait('delete confirmation', () => document.querySelector('.delete-confirm'));
       document.querySelector('.danger-button').click();
       await wait('deleted file disappears', () => !row('left', 'delete.txt'));
@@ -224,6 +228,6 @@
     let message = String(error);
     if (plan?.password) message = message.replaceAll(plan.password, '[redacted]');
     message = message.replace(/-----BEGIN [\s\S]*?PRIVATE KEY-----[\s\S]*?-----END [\s\S]*?PRIVATE KEY-----/g, '[private key redacted]');
-    window.runtime?.EventsEmit('__dragfm_native_smoke_result__', JSON.stringify({ success: false, phase: plan?.phase, stage, checks, error: message }));
+    window.runtime?.EventsEmit('__dragfm_native_smoke_result__', JSON.stringify({ success: false, phase: plan?.phase, stage, checks, error: message, leftPath: pathInput('left')?.value, rightPath: pathInput('right')?.value, leftCWD: cwd.left?.path, rightCWD: cwd.right?.path, active: document.querySelector('.file-pane.active')?.dataset.pane, modalCount: document.querySelectorAll('.modal-backdrop').length }));
   }
 })();
