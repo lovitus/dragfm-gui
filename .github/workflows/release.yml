@@ -12,7 +12,7 @@ permissions:
   contents: read
 concurrency:
   group: preview-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   intent:
     if: github.repository == 'lovitus/dragfm-gui'
@@ -106,6 +106,8 @@ jobs:
           RELEASE_TAG: ${{ needs.intent.outputs.tag }}
         run: |
           set -euo pipefail
+          current=$(gh api "repos/$GH_REPO/git/ref/${GITHUB_REF#refs/}" --jq '.object.sha')
+          test "$current" = "$GITHUB_SHA" || { echo 'Ref advanced; refusing to publish superseded source'; exit 1; }
           (cd release-bundle && sha256sum --check SHA256SUMS)
           gh release create "$RELEASE_TAG" release-bundle/* \
             --target "$GITHUB_SHA" --draft --prerelease --latest=false \
@@ -113,6 +115,8 @@ jobs:
             --notes-file release-bundle/RELEASE_NOTES.md
           gh release download "$RELEASE_TAG" --dir downloaded-release
           (cd downloaded-release && sha256sum --check SHA256SUMS)
+          current=$(gh api "repos/$GH_REPO/git/ref/${GITHUB_REF#refs/}" --jq '.object.sha')
+          test "$current" = "$GITHUB_SHA" || { echo 'Ref advanced; keeping superseded release as draft'; exit 1; }
           gh release edit "$RELEASE_TAG" --draft=false --prerelease=true --latest=false
           gh release view "$RELEASE_TAG" --json url,isDraft,isPrerelease,tagName,assets > release-result.json
           python3 - <<'PY'
