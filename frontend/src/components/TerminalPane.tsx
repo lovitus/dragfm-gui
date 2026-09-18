@@ -16,6 +16,8 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
   const sessionRef = useRef('')
   const reportErrorRef = useRef<(reason: unknown) => void>(() => {})
   const initialPath = useRef(path)
+  const displayedPath = useRef(path)
+  displayedPath.current = path
   const onCWDRef = useRef(onCWD)
   onCWDRef.current = onCWD
   const activeRef = useRef(active)
@@ -25,6 +27,7 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
     if (!host.current) return
     let disposed = false
     let session = ''
+    let shellPath: string | undefined
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
@@ -63,9 +66,13 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
     })
     const removeCWD = onEvent('terminal:cwd', (event) => {
       if (event.session === session && event.pane === pane) {
-        // This path originated in the shell. Mark it as already applied before
-        // React updates the prop, otherwise the prop effect writes a second,
-        // visible `cd` back into the same PTY.
+        const unchanged = shellPath === event.path
+        shellPath = event.path
+        // A delayed duplicate prompt from the previous directory is not a
+        // shell navigation. It must not undo a newer file-pane navigation
+        // while the PTY is acknowledging the requested cd.
+        if (unchanged && event.path !== displayedPath.current) return
+        // Avoid echoing a genuine shell-originated cd back into the PTY.
         initialPath.current = event.path
         onCWDRef.current(event.path)
       }

@@ -248,7 +248,12 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
           active={activePane === pane}
           dropTarget={dropTarget}
           onFocus={() => setActivePane(pane)}
-          onNavigate={(path, fromTerminal) => void load(pane, path, undefined, Boolean(fromTerminal && path === modelsRef.current[pane].listing.path))}
+          onNavigate={(path, fromTerminal) => {
+            // An unchanged shell prompt is a refresh, not new navigation. In
+            // particular, it must not supersede an in-flight Backspace/List.
+            if (fromTerminal && path === modelsRef.current[pane].listing.path) void load(pane, undefined, undefined, true)
+            else void load(pane, path)
+          }}
           onEndpoint={(endpoint) => void changeEndpoint(pane, endpoint)}
           onRefresh={() => void load(pane)}
           onSelect={(entry) => select(pane, entry)}
