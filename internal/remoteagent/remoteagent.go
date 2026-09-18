@@ -211,8 +211,8 @@ func (s *Session) StartHansClient(job, binary, server, socks, identity, passphra
 }
 
 func (s *Session) ProcessDiagnostics(ctx context.Context, job string) (string, error) {
-	response, err := s.CallContext(ctx, "process-diagnostics", map[string]string{"job": job}, nil)
-	return response.Values["output"], err
+	values, err := s.CallContext(ctx, "process-diagnostics", map[string]string{"job": job}, nil)
+	return values["output"], err
 }
 func (s *Session) ProcessStatus(ctx context.Context, job string) error {
 	_, err := s.CallContext(ctx, "process-status", map[string]string{"job": job}, nil)

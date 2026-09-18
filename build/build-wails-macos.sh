@@ -2,6 +2,7 @@
 set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root"
 output_dir=${1:-"$project_root/dist"}
 build_root="$project_root/.buildtmp/wails"
 mkdir -p "$output_dir" "$build_root/cache" "$build_root/tmp"
@@ -10,13 +11,15 @@ export TMPDIR="$build_root/tmp"
 export GOTMPDIR="$build_root/tmp"
 export GOCACHE="$build_root/cache"
 # Match Wails' supported deployment floor instead of inheriting the build
-# machine's current macOS version from clang (which would make the resulting
-# binary refuse to start on older systems).
+# machine's current macOS version from clang.
 export MACOSX_DEPLOYMENT_TARGET=11.0
 export CGO_CFLAGS="${CGO_CFLAGS:+$CGO_CFLAGS }-mmacosx-version-min=11.0"
 export CGO_CXXFLAGS="${CGO_CXXFLAGS:+$CGO_CXXFLAGS }-mmacosx-version-min=11.0"
 export CGO_LDFLAGS="${CGO_LDFLAGS:+$CGO_LDFLAGS }-mmacosx-version-min=11.0"
 
+# The controller must embed agents built from this exact revision, not the
+# historical migration payload. CGO is disabled for all four Linux targets.
+"$project_root/build/build-linux-agents.sh"
 if [ ! -d "$project_root/frontend/node_modules" ]; then
   npm --prefix "$project_root/frontend" ci
 fi

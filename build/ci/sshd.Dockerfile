@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    openssh-server openssh-client rsync ncat sudo iproute2 python3 procps ca-certificates \
+    openssh-server openssh-client rsync ncat sudo iproute2 net-tools python3 procps ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /bin/bash tester \
     && passwd -d tester \
