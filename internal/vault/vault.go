@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	FileName      = "dragfm-gui.vault"
-	magic         = "DFGUIV01"
-	maxHeaderSize = 1 << 20
+	FileName        = "dragfm-gui.vault"
+	magic           = "DFGUIV01"
+	maxHeaderSize   = 1 << 20
+	maxVaultPayload = 64 << 20
 )
 
 var ErrWrongPassword = errors.New("主密码错误或保险库损坏")
@@ -83,9 +84,12 @@ func Open(path string, password []byte) (*Store, appconfig.Document, error) {
 	if err != nil {
 		return nil, appconfig.Document{}, err
 	}
-	ciphertext, err := io.ReadAll(file)
+	ciphertext, err := io.ReadAll(io.LimitReader(file, maxVaultPayload+chacha20poly1305.Overhead+1))
 	if err != nil {
 		return nil, appconfig.Document{}, err
+	}
+	if len(ciphertext) > maxVaultPayload+chacha20poly1305.Overhead {
+		return nil, appconfig.Document{}, errors.New("vault ciphertext exceeds 64 MiB limit")
 	}
 	key := derive(password, header)
 	defer wipe(key)
@@ -156,7 +160,13 @@ func (s *Store) Save(password []byte, document appconfig.Document) error {
 		return err
 	}
 	defer wipe(plain)
+	if len(plain) > maxVaultPayload {
+		return errors.New("vault document exceeds 64 MiB limit")
+	}
 	header := s.Header
+	if err := validateHeader(header); err != nil {
+		return err
+	}
 	header.Nonce = make([]byte, chacha20poly1305.NonceSizeX)
 	if _, err := rand.Read(header.Nonce); err != nil {
 		return err
@@ -245,10 +255,19 @@ func readHeader(reader io.Reader) (Header, error) {
 	if err := json.Unmarshal(data, &header); err != nil {
 		return Header{}, err
 	}
-	if header.Version != 1 || len(header.Salt) != 16 || len(header.Nonce) != chacha20poly1305.NonceSizeX || header.Time == 0 || header.Memory < 8*1024 || header.Threads == 0 {
-		return Header{}, errors.New("invalid vault header")
+	if err := validateHeader(header); err != nil {
+		return Header{}, err
 	}
 	return header, nil
+}
+
+// Bound the unauthenticated header before deriving its key. Otherwise a
+// malformed vault can exhaust RAM or CPU before AEAD authentication rejects it.
+func validateHeader(header Header) error {
+	if header.Version != 1 || len(header.Salt) != 16 || len(header.Nonce) != chacha20poly1305.NonceSizeX || header.Time < 1 || header.Time > 10 || header.Memory < 8*1024 || header.Memory > 256*1024 || header.Threads < 1 || header.Threads > 16 || len(header.Hint) > maxHeaderSize/2 {
+		return errors.New("invalid or excessive vault header parameters")
+	}
+	return nil
 }
 
 func headerAAD(header Header) []byte {
