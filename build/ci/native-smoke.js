@@ -156,7 +156,10 @@
       assert((await api.JobSnapshot()).filter((item) => item.state === 'running').length === 1, 'more than one job running');
       checks.push('actual directory drag/drop and one Running plus one Pending visible together');
       const pending = await queueCommand('sleep 30; printf pending-should-not-run');
-      const pendingRow = await wait('pending command visible', () => [...document.querySelectorAll('.pending-list .queue-row')].find((item) => item.textContent.includes('pending-should-not-run')));
+      // Command bodies deliberately do not enter the task description/history.
+      // There is exactly one queued command in this fixture; identify its UI
+      // row using the same sanitized description returned by the real backend.
+      const pendingRow = await wait('pending command visible', () => [...document.querySelectorAll('.pending-list .queue-row')].find((item) => item.querySelector('span')?.textContent === pending.description));
       pendingRow.querySelector('button').click();
       await complete(pending.id, 'cancelled');
       const firstDone = await complete(first.id);
