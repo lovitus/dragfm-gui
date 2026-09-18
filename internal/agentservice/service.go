@@ -440,6 +440,12 @@ func (s *Service) wait(ctx context.Context, jobID string) error {
 	}
 	select {
 	case err := <-job.done:
+		// Closing the listener on cancellation also readies job.done. Either
+		// select arm may win; preserve cancellation rather than treating the
+		// resulting socket error as a retryable transport failure.
+		if err != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	case <-ctx.Done():
 		_ = job.listener.Close()
