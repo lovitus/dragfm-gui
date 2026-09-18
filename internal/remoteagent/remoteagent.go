@@ -210,6 +210,18 @@ func (s *Session) StartHansClient(job, binary, server, socks, identity, passphra
 	return err
 }
 
+func (s *Session) ProcessDiagnostics(ctx context.Context, job string) (string, error) {
+	response, err := s.CallContext(ctx, "process-diagnostics", map[string]string{"job": job}, nil)
+	return response.Values["output"], err
+}
+func (s *Session) ProcessStatus(ctx context.Context, job string) error {
+	_, err := s.CallContext(ctx, "process-status", map[string]string{"job": job}, nil)
+	return err
+}
+func (s *Session) ProbeSOCKSTCP(ctx context.Context, proxyAddress, targetAddress string) error {
+	_, err := s.CallContext(ctx, "socks-tcp-probe", map[string]string{"proxy": proxyAddress, "target": targetAddress}, nil)
+	return err
+}
 func (s *Session) StopProcess(job string) error {
 	_, err := s.Call("process-stop", map[string]string{"job": job}, nil)
 	return err

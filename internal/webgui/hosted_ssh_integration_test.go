@@ -104,7 +104,7 @@ func TestHostedSSHQueueAndHistory(t *testing.T) {
 			// identities stay pinned; no password or host-key acceptance here.
 			challenge := value.(ChallengeModel)
 			accepted := challenge.Kind == "confirm" || (challenge.Kind == "password" && strings.Contains(challenge.Title, "提权"))
-			go func() { _ = app.ResolveChallenge(challenge.ID, accepted, "", false) }()
+			go app.ResolveChallenge(challenge.ID, accepted, "", false)
 			return
 		}
 		if name != "job:update" {

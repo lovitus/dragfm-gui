@@ -500,6 +500,23 @@ func (a *App) runHansRole(ctx context.Context, operation transfer.Operation, pre
 	if err != nil {
 		return err
 	}
+	a.mu.RLock()
+	serverHost, hostExists := a.document.HostByName(server.Name())
+	a.mu.RUnlock()
+	if !hostExists {
+		return errors.New("Hans server configuration is missing")
+	}
+	serverRoute, err := a.routeForHost(serverHost)
+	if err != nil {
+		return err
+	}
+	if len(serverRoute.Hops) == 0 {
+		return errors.New("Hans server SSH route is empty")
+	}
+	serverPort := serverRoute.Hops[len(serverRoute.Hops)-1].Port
+	if serverPort == 0 {
+		serverPort = 22
+	}
 	network := randomHansNetwork()
 	serverTunnelIP := strings.TrimSuffix(network, ".0") + ".1"
 	passphrase := randomTransferToken(32)
@@ -526,7 +543,7 @@ func (a *App) runHansRole(ctx context.Context, operation transfer.Operation, pre
 			clientFailures = append(clientFailures, fmt.Errorf("%s: %w", address, err))
 			continue
 		}
-		if err := waitForHansSOCKS(ctx, clientAgent, socksAddress); err != nil {
+		if err := waitForHansSOCKS(ctx, clientAgent, socksAddress, net.JoinHostPort(serverTunnelIP, fmt.Sprint(serverPort)), serverAgent, serverJob, clientJob); err != nil {
 			_ = clientAgent.StopProcess(clientJob)
 			clientFailures = append(clientFailures, fmt.Errorf("%s: %w", address, err))
 			continue
@@ -563,6 +580,12 @@ func (a *App) runHansRole(ctx context.Context, operation transfer.Operation, pre
 				err = a.runHansMethod(ctx, operation, transferAgent, server, direction, elevated, serverTunnelIP, socksAddress, method)
 			}
 			if err != nil {
+				if !transfer.Retryable(err) {
+					if cleanupTransferAgent != nil {
+						cleanupTransferAgent()
+					}
+					return err
+				}
 				transferFailures = append(transferFailures, fmt.Errorf("%s/elevated=%t: %w", method, elevated, err))
 				continue
 			}
@@ -659,10 +682,22 @@ func remoteIsRoot(ctx context.Context, remote *endpoint.Remote) (bool, error) {
 	return strings.TrimSpace(output.String()) == "0", nil
 }
 
-func waitForHansSOCKS(ctx context.Context, agent *remoteagent.Session, address string) error {
+// Require an actual TCP CONNECT through the authenticated v5 tunnel,
+// not merely a listening SOCKS socket. Retain bounded redacted diagnostics.
+func waitForHansSOCKS(ctx context.Context, client *remoteagent.Session, proxyAddress, targetAddress string, server *remoteagent.Session, serverJob, clientJob string) error {
 	var last error
-	for attempt := 0; attempt < 6; attempt++ {
-		if _, err := agent.ProbeTCP(address); err == nil {
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := server.ProcessStatus(ctx, serverJob); err != nil {
+			return fmt.Errorf("Hans server: %w", err)
+		}
+		if err := client.ProcessStatus(ctx, clientJob); err != nil {
+			return fmt.Errorf("Hans client: %w", err)
+		}
+		if err := client.ProbeSOCKSTCP(ctx, proxyAddress, targetAddress); err == nil {
 			return nil
 		} else {
 			last = err
@@ -675,7 +710,9 @@ func waitForHansSOCKS(ctx context.Context, agent *remoteagent.Session, address s
 		case <-timer.C:
 		}
 	}
-	return fmt.Errorf("Hans SOCKS 未就绪: %w", last)
+	serverLog, _ := server.ProcessDiagnostics(ctx, serverJob)
+	clientLog, _ := client.ProcessDiagnostics(ctx, clientJob)
+	return fmt.Errorf("Hans tunnel TCP readiness failed: %w; server: %s; client: %s", last, serverLog, clientLog)
 }
 
 func randomHansNetwork() string {

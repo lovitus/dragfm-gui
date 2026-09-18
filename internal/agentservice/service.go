@@ -44,11 +44,6 @@ type Service struct {
 	ctx       context.Context
 }
 
-type processJob struct {
-	command *exec.Cmd
-	done    chan error
-}
-
 type listenerJob struct {
 	listener net.Listener
 	done     chan error
@@ -100,6 +95,12 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		response.Values["median_ms"], err = tcpProbe(request.Options["address"])
 	case "hans-server-start", "hans-client-start":
 		response.Values["fingerprint"], err = s.startHans(request)
+	case "process-diagnostics":
+		response.Values["output"], err = s.processDiagnostics(request.Options["job"])
+	case "process-status":
+		err = s.processStatus(request.Options["job"])
+	case "socks-tcp-probe":
+		err = probeSOCKSTCP(s.ctx, request.Options["proxy"], request.Options["target"])
 	case "process-stop":
 		err = s.stopProcess(request.Options["job"])
 	case "remove-owned-temp":
@@ -333,104 +334,6 @@ func cleanupOwnedTemps(root, keep string, olderThan time.Duration) error {
 		_ = os.RemoveAll(directory)
 	}
 	return nil
-}
-
-func (s *Service) startHans(request agentproto.Request) (string, error) {
-	binary, identity, jobID := request.Options["binary"], request.Options["identity"], request.Options["job"]
-	passphrase := request.Secret["passphrase"]
-	if binary == "" || identity == "" || jobID == "" || passphrase == "" {
-		return "", errors.New("Hans process options are incomplete")
-	}
-	passphrasePath := "/proc/self/fd/3"
-	if runtime.GOOS != "linux" {
-		// The production helper runs only on Linux. /dev/fd keeps the process
-		// contract testable on the macOS development host without changing the
-		// descriptor inherited by Hans.
-		passphrasePath = "/dev/fd/3"
-	}
-	args := []string{"-f", "--require-v5", "--passphrase-file", passphrasePath, "--identity-file", identity}
-	fingerprint := ""
-	if request.Action == "hans-server-start" {
-		network, lease := request.Options["network"], request.Options["lease"]
-		if net.ParseIP(network) == nil || lease == "" {
-			return "", errors.New("invalid Hans server network or lease path")
-		}
-		identityCommand := exec.Command(binary, "--show-identity", "--identity-file", identity)
-		output, err := identityCommand.Output()
-		if err != nil {
-			return "", err
-		}
-		fields := strings.Fields(string(output))
-		if len(fields) == 0 {
-			return "", errors.New("Hans returned no server fingerprint")
-		}
-		fingerprint = fields[len(fields)-1]
-		args = append(args, "-s", network, "--lease-file", lease)
-	} else {
-		server, socks, pin := request.Options["server"], request.Options["socks"], request.Secret["fingerprint"]
-		if server == "" || socks == "" || pin == "" {
-			return "", errors.New("invalid Hans client server, SOCKS, or fingerprint")
-		}
-		args = append(args, "-c", server, "--feature", "userspace", "--socks5", socks, "--server-fingerprint", pin)
-	}
-	command := exec.Command(binary, args...)
-	configureChildLifecycle(command)
-	secretReader, secretWriter, err := os.Pipe()
-	if err != nil {
-		return "", err
-	}
-	command.ExtraFiles = []*os.File{secretReader}
-	// Nil attaches the child's output to the null device without the copy
-	// goroutines that io.Discard would create. That also makes cancellation
-	// independent of any descriptors inherited by a child process.
-	command.Stdout, command.Stderr = nil, nil
-	if err := command.Start(); err != nil {
-		_ = secretReader.Close()
-		_ = secretWriter.Close()
-		return "", err
-	}
-	_ = secretReader.Close()
-	if _, err := io.WriteString(secretWriter, passphrase+"\n"); err != nil {
-		_ = secretWriter.Close()
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		return "", err
-	}
-	_ = secretWriter.Close()
-	job := &processJob{command: command, done: make(chan error, 1)}
-	s.mu.Lock()
-	if _, exists := s.processes[jobID]; exists {
-		s.mu.Unlock()
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		return "", errors.New("duplicate process job")
-	}
-	s.processes[jobID] = job
-	s.mu.Unlock()
-	go func() { job.done <- command.Wait() }()
-	return fingerprint, nil
-}
-
-func (s *Service) stopProcess(jobID string) error {
-	s.mu.Lock()
-	job := s.processes[jobID]
-	delete(s.processes, jobID)
-	s.mu.Unlock()
-	if job == nil {
-		return nil
-	}
-	_ = job.command.Process.Signal(os.Interrupt)
-	select {
-	case err := <-job.done:
-		if _, ok := err.(*exec.ExitError); ok {
-			return nil
-		}
-		return err
-	case <-time.After(2 * time.Second):
-		_ = job.command.Process.Kill()
-		<-job.done
-		return nil
-	}
 }
 
 func tcpProbe(address string) (string, error) {

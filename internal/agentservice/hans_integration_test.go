@@ -90,6 +90,13 @@ func TestOfficialHansReleaseThroughAgentService(t *testing.T) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	for _, child := range []struct {
+		service *agentservice.Service
+		job     string
+	}{{server, serverJob}, {client, clientJob}} {
+		reply := child.service.Handle(agentproto.Request{Version: agentproto.ProtocolVersion, ID: "diagnose", Action: "process-diagnostics", Options: map[string]string{"job": child.job}})
+		t.Logf("%s: %s", child.job, reply.Values["output"])
+	}
 	t.Fatalf("official Hans userspace tunnel did not carry TCP: %v", lastErr)
 }
 
