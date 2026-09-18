@@ -21,7 +21,6 @@ import (
 	"github.com/lovitus/dragfm-gui/internal/assets"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"github.com/lovitus/dragfm-gui/internal/transfer"
-	"golang.org/x/crypto/ssh"
 )
 
 const markerName = ".dragfm-owner-v1"
@@ -30,7 +29,9 @@ type Session struct {
 	Protocol  *agentproto.Conn
 	Directory string
 	remote    *endpoint.Remote
-	ssh       *ssh.Session
+	ssh       io.Closer
+	ctx       context.Context
+	done      chan struct{}
 	stdin     io.WriteCloser
 	once      sync.Once
 	closeErr  error
@@ -59,17 +60,23 @@ func (s *Session) Call(action string, options, secret map[string]string) (map[st
 // cancelled. A helper session is intentionally single-use after cancellation;
 // this guarantees a blocked native child (rsync/scp/Hans) cannot keep the
 // global queue or shutdown path stuck indefinitely.
-func (s *Session) CallContext(ctx context.Context, action string, options, secret map[string]string) (map[string]string, error) {
+func (s *Session) call(ctx context.Context, action string, options, secret map[string]string) (map[string]string, error) {
 	if s == nil || s.Protocol == nil {
 		return nil, errors.New("remote helper is not running")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stopCancellation := context.AfterFunc(ctx, s.abortTransport)
+	defer stopCancellation()
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
-	stopCancellation := context.AfterFunc(ctx, func() { _ = s.ssh.Close() })
-	defer stopCancellation()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	id := randomHex(12)
 	request := agentproto.Request{Version: agentproto.ProtocolVersion, ID: id, Action: action, Options: options, Secret: secret}
 	if err := s.Protocol.Send(request); err != nil {
@@ -284,7 +291,7 @@ func start(ctx context.Context, remote *endpoint.Remote, architecture string, el
 		cleanup()
 		return nil, err
 	}
-	var stderr bytes.Buffer
+	var stderr helperOutput
 	sshSession.Stderr = &stderr
 	if elevated {
 		var uid bytes.Buffer
@@ -314,44 +321,32 @@ func start(ctx context.Context, remote *endpoint.Remote, architecture string, el
 			return nil, fmt.Errorf("send sudo credential: %w", err)
 		}
 	}
+	handshakeCtx, stopDeadline := context.WithTimeout(ctx, 15*time.Second)
+	stopHandshake := context.AfterFunc(handshakeCtx, func() { _ = sshSession.Close() })
 	protocol, err := agentproto.Client(stdout, stdin)
+	stopHandshake()
+	stopDeadline()
 	if err != nil {
 		_ = sshSession.Close()
 		cleanup()
 		return nil, fmt.Errorf("helper handshake: %w: %s", err, stderr.String())
 	}
-	session := &Session{Protocol: protocol, Directory: directory, remote: remote, ssh: sshSession, stdin: stdin, elevated: elevated}
+	session := &Session{Protocol: protocol, Directory: directory, remote: remote, ssh: sshSession, stdin: stdin, elevated: elevated, ctx: ctx, done: make(chan struct{})}
 	if _, err := session.Call("cleanup-stale-temps", map[string]string{"keep": directory, "older_seconds": strconv.FormatInt(int64((24*time.Hour)/time.Second), 10)}, nil); err != nil {
 		_ = session.Close()
 		return nil, fmt.Errorf("clean stale remote helpers: %w", err)
 	}
 	go func() {
-		<-ctx.Done()
-		_ = session.Close()
+		select {
+		case <-ctx.Done():
+			_ = session.Close()
+		case <-session.done:
+		}
 	}()
 	return session, nil
 }
 
 func quotePOSIX(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
-
-func (s *Session) Close() error {
-	if s == nil {
-		return nil
-	}
-	s.once.Do(func() {
-		if s.elevated {
-			_, _ = s.Call("remove-owned-temp", map[string]string{"path": s.Directory}, nil)
-		}
-		// Close the SSH channel before its stdin pipe. Closing stdin can otherwise
-		// wait behind a remote child that has stopped consuming protocol input.
-		sshErr := s.ssh.Close()
-		stdinErr := s.stdin.Close()
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		s.closeErr = errors.Join(sshErr, stdinErr, s.remote.Remove(cleanupCtx, s.Directory, true))
-	})
-	return s.closeErr
-}
 
 func CleanupStale(ctx context.Context, remote *endpoint.Remote, olderThan time.Duration) error {
 	entries, err := remote.List(ctx, "/tmp")
