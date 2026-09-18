@@ -62,7 +62,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     catch (reason) { setOperationError(String(reason)); return false }
   }, [])
 
-  const load = useCallback(async (pane: PaneID, path?: string, endpoint?: string) => {
+  const load = useCallback(async (pane: PaneID, path?: string, endpoint?: string, preserveSelection = false) => {
     // A completion refresh must not replace a newer user navigation with
     // the old, still-rendered directory while its request is in flight.
     if (path === undefined && endpoint === undefined && listingInFlight.current[pane]) return
@@ -71,11 +71,17 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     const revision = ++revisions.current[pane]
     const requestedPath = path || current.listing.path
     const requestedEndpoint = endpoint || current.listing.endpoint
-    setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: true, error: '', selected: undefined } }))
+    setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: true, error: '', selected: preserveSelection ? old[pane].selected : undefined } }))
     try {
       const listing = await api.list(pane, requestedEndpoint, requestedPath)
       if (revision !== revisions.current[pane]) return
-      setModels((old) => ({ ...old, [pane]: { listing, loading: false, error: '' } }))
+      setModels((old) => {
+        // Preserve the latest selection, including a click made while this
+        // background listing was pending. Never retain a deleted/stale entry.
+        const sameDirectory = old[pane].listing.path === listing.path && old[pane].listing.endpoint === listing.endpoint
+        const selected = preserveSelection && sameDirectory ? listing.entries.find((entry) => entry.path === old[pane].selected?.path) : undefined
+        return { ...old, [pane]: { listing, selected, loading: false, error: '' } }
+      })
     } catch (reason) {
       if (revision !== revisions.current[pane]) return
       setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: false, error: String(reason) } }))
@@ -133,7 +139,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
       if (changes.length) setActivity((activity) => [...activity, ...changes.map((job) => ({ ...job, observedAt: new Date().toISOString() }))].slice(-500))
       if (changes.some((job) => isFinished(job) && !old.get(job.id)?.finishedAt)) {
         window.clearTimeout(refreshTimer)
-        refreshTimer = window.setTimeout(() => { void load('left'); void load('right') }, 80)
+        refreshTimer = window.setTimeout(() => { void load('left', undefined, undefined, true); void load('right', undefined, undefined, true) }, 80)
       }
     }
     // Subscribe first; revision-aware merging closes the subscribe/snapshot race.
@@ -242,7 +248,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
           active={activePane === pane}
           dropTarget={dropTarget}
           onFocus={() => setActivePane(pane)}
-          onNavigate={(path) => void load(pane, path)}
+          onNavigate={(path, fromTerminal) => void load(pane, path, undefined, Boolean(fromTerminal && path === modelsRef.current[pane].listing.path))}
           onEndpoint={(endpoint) => void changeEndpoint(pane, endpoint)}
           onRefresh={() => void load(pane)}
           onSelect={(entry) => select(pane, entry)}
