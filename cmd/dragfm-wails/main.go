@@ -18,20 +18,29 @@ func main() {
 	if handled, code := rsyncbridge.ChildMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
 		os.Exit(code)
 	}
+	smoke, err := readNativeSmoke(os.Args[1:])
+	if err != nil {
+		panic(err)
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		executable = filepath.Join(".", "dragfm-gui")
 	}
-	vaultPath, err := vault.Locate(executable)
-	if err != nil {
-		panic(err)
+	var vaultPath string
+	if smoke != nil {
+		vaultPath = filepath.Join(smoke.directory, "vault.json")
+	} else {
+		vaultPath, err = vault.Locate(executable)
+		if err != nil {
+			panic(err)
+		}
 	}
 	assets, err := fs.Sub(frontend.Assets, "dist")
 	if err != nil {
 		panic(err)
 	}
 	app := webgui.New(vaultPath)
-	err = wails.Run(&options.App{
+	application := &options.App{
 		Title:                    "dragfm",
 		Width:                    1440,
 		Height:                   860,
@@ -46,8 +55,15 @@ func main() {
 		OnStartup:                app.Startup,
 		OnShutdown:               app.Shutdown,
 		Bind:                     []interface{}{app},
-	})
+	}
+	if smoke != nil {
+		application.OnDomReady = smoke.domReady
+	}
+	err = wails.Run(application)
 	if err != nil {
 		panic(err)
+	}
+	if smoke != nil && !smoke.succeeded() {
+		os.Exit(1)
 	}
 }
