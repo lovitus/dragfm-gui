@@ -3,7 +3,9 @@
 set -euo pipefail
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$project_root"
-: "${RUNNER_TEMP:?RUNNER_TEMP must identify the disposable runner's temporary directory}"
+: "${RUNNER_TEMP:?RUNNER_TEMP must identify the temporary directory of the disposable runner}"
+mkdir -p test-results
+exec > >(tee test-results/ssh-fixture.log) 2>&1
 fixture=$(mktemp -d "$RUNNER_TEMP/dragfm-ssh.XXXXXX")
 prefix="dragfm-ci-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}-$$"
 network="$prefix-net"
@@ -20,7 +22,7 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
-mkdir -p test-results "$fixture/key"
+mkdir -p "$fixture/key"
 ssh-keygen -q -t ed25519 -N '' -f "$fixture/id_ed25519"
 cp "$fixture/id_ed25519.pub" "$fixture/key/authorized_keys"
 chmod 0600 "$fixture/id_ed25519"
