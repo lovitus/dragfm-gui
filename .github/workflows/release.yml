@@ -1,0 +1,128 @@
+name: tested-macos-preview-release
+on:
+  push:
+    branches: ['release/v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New preview tag, for example v0.2.0-rc.1'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: preview-release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  intent:
+    if: github.repository == 'lovitus/dragfm-gui'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Require an explicit new preview release identifier
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME#release/}}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]] || { echo 'Not a preview release tag'; exit 1; }
+          printf 'value=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+  validate:
+    needs: intent
+    uses: ./.github/workflows/build.yml
+  ssh:
+    needs: intent
+    uses: ./.github/workflows/ssh-integration.yml
+  package:
+    needs: [validate, ssh]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install locked packages only to collect their license notices
+        run: npm --prefix frontend ci --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dragfm-gui-*
+          path: release-input
+      - name: Verify evidence, package the tested executable and corresponding source
+        run: python3 build/ci/package-release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-release-bundle
+          path: release-bundle/
+          if-no-files-found: error
+  verify-package:
+    needs: package
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: dragfm-gui-release-bundle
+          path: release-bundle
+      - name: Verify checksums and unpack the distributable
+        run: |
+          set -euo pipefail
+          (cd release-bundle && shasum -a 256 --check SHA256SUMS)
+          mkdir unpacked
+          tar -xzf release-bundle/dragfm-gui-darwin-arm64.tar.gz -C unpacked
+          file unpacked/dragfm-gui/dragfm-gui
+          codesign --verify --verbose=2 unpacked/dragfm-gui/dragfm-gui
+      - name: Re-test the extracted release executable through its native window
+        run: python3 build/ci/native-smoke.py unpacked/dragfm-gui/dragfm-gui
+      - name: Preserve distributable verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-packaged-native-evidence
+          path: test-results/native-macos-arm64/
+          if-no-files-found: warn
+  publish:
+    needs: [intent, verify-package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dragfm-gui-release-bundle
+          path: release-bundle
+      - name: Create draft, verify downloaded assets, then publish the preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.intent.outputs.tag }}
+        run: |
+          set -euo pipefail
+          (cd release-bundle && sha256sum --check SHA256SUMS)
+          gh release create "$RELEASE_TAG" release-bundle/* \
+            --target "$GITHUB_SHA" --draft --prerelease --latest=false \
+            --title "dragfm-gui $RELEASE_TAG — macOS arm64 preview" \
+            --notes-file release-bundle/RELEASE_NOTES.md
+          gh release download "$RELEASE_TAG" --dir downloaded-release
+          (cd downloaded-release && sha256sum --check SHA256SUMS)
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease=true --latest=false
+          gh release view "$RELEASE_TAG" --json url,isDraft,isPrerelease,tagName,assets > release-result.json
+          python3 - <<'PY'
+          import json, os
+          result=json.load(open('release-result.json'))
+          assert result['tagName']==os.environ['RELEASE_TAG'] and not result['isDraft'] and result['isPrerelease']
+          print(result['url'])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-published-release
+          path: release-result.json
+          if-no-files-found: error
