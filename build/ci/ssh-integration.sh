@@ -72,12 +72,16 @@ export DRAGFM_E2E_SOCKS_SPEC="dragfm-ci:fixture-only@$relay_ip:1080"
 export DRAGFM_E2E_NCAT=1
 export DRAGFM_E2E_HANS=1
 export DRAGFM_E2E_SUDO=1
+set +e
 go test -mod=vendor -tags=integration -race -count=1 -timeout=12m -json ./internal/webgui \
   -run 'Test(RemoteTransferMethodsOnHostedFixtures|HostedSSHQueueAndHistory|HostedNonRootSudoTransfers)' \
   2>&1 | tee test-results/ssh-integration.jsonl
+ssh_status=${PIPESTATUS[0]}
+set -e
 # Check the official Hans executable through the agent service as root only
 # inside the disposable container, not via a private runner or user machine.
 CGO_ENABLED=0 go test -mod=vendor -tags=integration -c -o "$fixture/hans.test" ./internal/agentservice
 docker cp "$fixture/hans.test" "$prefix-target:/tmp/hans.test"
 docker exec "$prefix-target" /tmp/hans.test -test.v -test.timeout=90s \
   -test.run '^TestOfficialHansReleaseThroughAgentService$' 2>&1 | tee test-results/hans-agent.log
+exit "$ssh_status"

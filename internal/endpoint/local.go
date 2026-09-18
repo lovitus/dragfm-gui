@@ -97,14 +97,20 @@ func (l *Local) Chtimes(_ context.Context, path string, atime, mtime time.Time) 
 	return os.Chtimes(path, atime, mtime)
 }
 
-func (l *Local) Remove(_ context.Context, path string, recursive bool) error {
+func (l *Local) Remove(ctx context.Context, path string, recursive bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if recursive {
 		return os.RemoveAll(path)
 	}
 	return os.Remove(path)
 }
 
-func (l *Local) Rename(_ context.Context, source, target string, overwrite bool) error {
+func (l *Local) Rename(ctx context.Context, source, target string, overwrite bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !overwrite {
 		if _, err := os.Lstat(target); err == nil {
 			return fs.ErrExist

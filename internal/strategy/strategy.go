@@ -99,6 +99,10 @@ func Execute(ctx context.Context, attempts []Attempt, approve Approval, emit fun
 		if err == nil {
 			return nil
 		}
+		var retry interface{ Retryable() bool }
+		if errors.As(err, &retry) && !retry.Retryable() {
+			return err
+		}
 		failures = append(failures, fmt.Errorf("%s/%s/%s: %w", attempt.Tier, attempt.Direction, attempt.Method, err))
 	}
 	return fmt.Errorf("所有传输路径均失败: %w", errors.Join(failures...))

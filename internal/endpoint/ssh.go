@@ -295,6 +295,9 @@ func (r *Remote) Chtimes(ctx context.Context, target string, atime, mtime time.T
 }
 
 func (r *Remote) Remove(ctx context.Context, target string, recursive bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if r.sftp != nil && !recursive {
 		return r.sftp.Remove(target)
 	}
@@ -306,6 +309,9 @@ func (r *Remote) Remove(ctx context.Context, target string, recursive bool) erro
 }
 
 func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if r.sftp != nil {
 		if !overwrite {
 			if _, err := r.sftp.Lstat(target); err == nil {
@@ -314,13 +320,7 @@ func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bo
 				return err
 			}
 		}
-		if overwrite {
-			if err := r.sftp.PosixRename(source, target); err == nil {
-				return nil
-			}
-			_ = r.sftp.Remove(target)
-		}
-		return r.sftp.Rename(source, target)
+		return renameSFTP(r.sftp, source, target, overwrite)
 	}
 	flag := ""
 	if !overwrite {
@@ -336,13 +336,38 @@ func (r *Remote) CopyNative(ctx context.Context, source, target string, sourceDi
 	return r.Exec(ctx, "cp -a -- "+shellQuote(source)+" "+shellQuote(target), ExecOptions{})
 }
 
+// Both streams share a lock even when their io.Writer values differ: two
+// wrappers may still write to the same underlying non-thread-safe buffer.
+type serializedSSHOutput struct {
+	mu     *sync.Mutex
+	writer io.Writer
+}
+
+func (w serializedSSHOutput) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writer.Write(data)
+}
+
 func (r *Remote) Exec(ctx context.Context, command string, options ExecOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	session, err := r.client.NewSession()
 	if err != nil {
 		return err
 	}
 	defer session.Close()
-	session.Stdin, session.Stdout, session.Stderr = options.Stdin, options.Stdout, options.Stderr
+	session.Stdin = options.Stdin
+	// x/crypto/ssh copies stdout and stderr concurrently, unlike os/exec's
+	// combined-writer handling. Callers may intentionally supply one buffer.
+	var outputMu sync.Mutex
+	if options.Stdout != nil {
+		session.Stdout = serializedSSHOutput{mu: &outputMu, writer: options.Stdout}
+	}
+	if options.Stderr != nil {
+		session.Stderr = serializedSSHOutput{mu: &outputMu, writer: options.Stderr}
+	}
 	if options.Directory != "" {
 		command = "cd -- " + shellQuote(options.Directory) + " && " + command
 	}
@@ -613,17 +638,20 @@ func (w *sftpAtomicWriter) Commit() error {
 	if w.done {
 		return errors.New("atomic writer already completed")
 	}
+	if _, supported := w.client.HasExtension("fsync@openssh.com"); supported {
+		if err := w.file.Sync(); err != nil {
+			_ = w.Abort()
+			return err
+		}
+	}
 	if err := w.file.Close(); err != nil {
 		_ = w.Abort()
 		return err
 	}
-	if err := w.client.PosixRename(w.temporary, w.target); err != nil {
-		_ = w.client.Remove(w.target)
-		if err = w.client.Rename(w.temporary, w.target); err != nil {
-			_ = w.client.Remove(w.temporary)
-			w.done = true
-			return err
-		}
+	if err := renameSFTP(w.client, w.temporary, w.target, true); err != nil {
+		_ = w.client.Remove(w.temporary)
+		w.done = true
+		return err
 	}
 	w.done = true
 	return nil
@@ -664,9 +692,13 @@ func (w *sshAtomicWriter) Commit() error {
 		_ = w.Abort()
 		return err
 	}
-	w.done = true
 	command := fmt.Sprintf("chmod %04o -- %s && mv -f -- %s %s", w.mode.Perm(), shellQuote(w.temporary), shellQuote(w.temporary), shellQuote(w.target))
-	return w.remote.Exec(context.Background(), command, ExecOptions{})
+	if err := w.remote.Exec(context.Background(), command, ExecOptions{}); err != nil {
+		_ = w.Abort()
+		return err
+	}
+	w.done = true
+	return nil
 }
 func (w *sshAtomicWriter) Abort() error {
 	if w.done {

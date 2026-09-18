@@ -47,11 +47,12 @@ func ChildMain(args []string, stdin io.Reader, stdout, stderr io.Writer) (bool, 
 		fmt.Fprintln(stderr, "dragfm rsync transport: missing loopback address or token")
 		return true, 2
 	}
-	connection, err := net.Dial("tcp", args[1])
+	connection, err := net.DialTimeout("tcp", args[1], transportHandshakeTimeout)
 	if err != nil {
 		fmt.Fprintln(stderr, "dragfm rsync transport:", err)
 		return true, 1
 	}
+	_ = connection.SetDeadline(time.Now().Add(transportHandshakeTimeout))
 	tcp, _ := connection.(*net.TCPConn)
 	if err := json.NewEncoder(connection).Encode(request{Token: args[2], Args: append([]string(nil), args[3:]...)}); err != nil {
 		_ = connection.Close()
@@ -64,6 +65,7 @@ func ChildMain(args []string, stdin io.Reader, stdout, stderr io.Writer) (bool, 
 		fmt.Fprintln(stderr, "dragfm rsync transport: parent handshake failed")
 		return true, 1
 	}
+	_ = connection.SetDeadline(time.Time{})
 	writeDone := make(chan error, 1)
 	go func() {
 		_, copyErr := io.Copy(connection, stdin)
@@ -74,7 +76,21 @@ func ChildMain(args []string, stdin io.Reader, stdout, stderr io.Writer) (bool, 
 	}()
 	_, readErr := io.Copy(stdout, connection)
 	_ = connection.Close()
-	writeErr := <-writeDone
+	// rsync waits for its rsh subprocess to exit before closing the input pipe.
+	// Waiting for that pipe here creates a cycle after the remote EOF. This
+	// transport subprocess owns stdin; close it when possible and never wait
+	// on an arbitrary Reader once the authenticated parent has finished.
+	if closer, ok := stdin.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	var writeErr error
+	select {
+	case writeErr = <-writeDone:
+		if errors.Is(writeErr, net.ErrClosed) || errors.Is(writeErr, os.ErrClosed) || errors.Is(writeErr, io.ErrClosedPipe) {
+			writeErr = nil
+		}
+	default:
+	}
 	if err := errors.Join(readErr, writeErr); err != nil {
 		fmt.Fprintln(stderr, "dragfm rsync transport:", err)
 		return true, 1
@@ -129,7 +145,11 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 			acceptedChannel <- accepted{err: acceptErr}
 			return
 		}
-		line, readErr := bufio.NewReader(connection).ReadBytes('\n')
+		_ = connection.SetDeadline(time.Now().Add(transportHandshakeTimeout))
+		line, readErr := bufio.NewReader(io.LimitReader(connection, 65537)).ReadBytes('\n')
+		if len(line) > 65536 {
+			readErr = errors.New("rsync transport handshake is too large")
+		}
 		var payload request
 		if readErr == nil {
 			readErr = json.Unmarshal(line, &payload)
@@ -147,6 +167,7 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 			acceptedChannel <- accepted{err: writeErr}
 			return
 		}
+		_ = connection.SetDeadline(time.Time{})
 		acceptedChannel <- accepted{connection: connection, request: payload}
 	}()
 	if err := command.Start(); err != nil {
@@ -235,6 +256,9 @@ func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arg
 	waitErr := session.Wait()
 	cancel()
 	inputErr := <-inputDone
+	if waitErr == nil && outputErr == nil && (errors.Is(inputErr, net.ErrClosed) || errors.Is(inputErr, io.ErrClosedPipe)) {
+		inputErr = nil // Our shutdown unblocked an otherwise successful upload.
+	}
 	if waitErr != nil && stderr.Len() > 0 {
 		waitErr = fmt.Errorf("remote rsync: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 	}

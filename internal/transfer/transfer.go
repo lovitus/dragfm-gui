@@ -59,7 +59,7 @@ type ManifestItem struct {
 	SourcePath string
 }
 
-var ErrSourceChanged = errors.New("源文件在传输期间发生变化")
+var ErrSourceChanged = PreserveSource(errors.New("源文件在传输期间发生变化"))
 
 func Run(ctx context.Context, operation Operation) (Result, error) {
 	if operation.Source == nil || operation.Destination == nil {
@@ -125,20 +125,23 @@ func Run(ctx context.Context, operation Operation) (Result, error) {
 	emit(operation, Progress{Stage: "verify", BytesTotal: before.Bytes, FilesTotal: result.Files})
 	afterSource, err := Snapshot(ctx, operation.Source, operation.SourcePath, true)
 	if err != nil {
-		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, fmt.Errorf("re-snapshot source: %w", err)
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, PreserveSource(fmt.Errorf("re-snapshot source: %w", err))
 	}
 	if err := CompareManifests(before, afterSource, false); err != nil {
 		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, errors.Join(ErrSourceChanged, err)
 	}
 	afterTarget, err := Snapshot(ctx, operation.Destination, operation.TargetPath, true)
 	if err != nil {
-		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, fmt.Errorf("snapshot target: %w", err)
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, PreserveSource(fmt.Errorf("snapshot target: %w", err))
 	}
 	if err := CompareManifests(before, afterTarget, true); err != nil {
-		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, fmt.Errorf("目标校验失败，源文件已保留: %w", err)
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, PreserveSource(fmt.Errorf("目标校验失败，源文件已保留: %w", err))
+	}
+	if err := VerifySourceUnchanged(ctx, operation.Source, operation.SourcePath, before); err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, err
 	}
 	if err := operation.Source.Remove(ctx, operation.SourcePath, before.Items[0].Mode.IsDir()); err != nil {
-		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files, Verification: "sha256"}, fmt.Errorf("已复制并校验，但删除源失败: %w", err)
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files, Verification: "sha256"}, PreserveSource(fmt.Errorf("已复制并校验，但删除源失败: %w", err))
 	}
 	result.Moved = true
 	result.Verification = "sha256"
@@ -297,14 +300,19 @@ func copyItem(ctx context.Context, operation Operation, item ManifestItem, targe
 		return nil
 	}
 	if item.Mode&fs.ModeSymlink != 0 {
-		if operation.Overwrite {
-			_ = operation.Destination.Remove(ctx, target, false)
-		} else if _, err := operation.Destination.Stat(ctx, target); err == nil {
-			return fs.ErrExist
-		} else if !errors.Is(err, fs.ErrNotExist) {
+		// Never unlink the previous destination before the new link exists.
+		if err := operation.Destination.MkdirAll(ctx, operation.Destination.Dir(target), 0700); err != nil {
 			return err
 		}
-		return operation.Destination.Symlink(ctx, item.LinkTarget, target)
+		staged, err := stagingPath(target)
+		if err != nil {
+			return err
+		}
+		defer operation.Destination.Remove(context.Background(), staged, false)
+		if err := operation.Destination.Symlink(ctx, item.LinkTarget, staged); err != nil {
+			return err
+		}
+		return operation.Destination.Rename(ctx, staged, target, operation.Overwrite)
 	}
 	if !item.Mode.IsRegular() {
 		return fmt.Errorf("unsupported file type %s", item.Mode.Type())
@@ -362,8 +370,12 @@ func copyItem(ctx context.Context, operation Operation, item ManifestItem, targe
 		return err
 	}
 	committed = true
-	_ = operation.Destination.Chmod(ctx, target, item.Mode)
-	_ = operation.Destination.Chtimes(ctx, target, item.ModifiedTime(), item.ModifiedTime())
+	if err := operation.Destination.Chmod(ctx, target, item.Mode); err != nil {
+		return err
+	}
+	if err := operation.Destination.Chtimes(ctx, target, item.ModifiedTime(), item.ModifiedTime()); err != nil {
+		return err
+	}
 	progress.FilesDone++
 	return nil
 }
@@ -402,11 +414,25 @@ func CompareManifests(expected, actual Manifest, ignoreModified bool) error {
 	if !ignoreModified && expected.RootInode != 0 && actual.RootInode != 0 && (expected.RootDevice != actual.RootDevice || expected.RootInode != actual.RootInode) {
 		return errors.New("source root identity changed")
 	}
+	if len(expected.Items) == 0 || len(actual.Items) == 0 {
+		return errors.New("empty verification manifest")
+	}
+	if !ignoreModified && len(expected.Items) != len(actual.Items) {
+		return errors.New("source entry set changed")
+	}
 	actualByRelative := make(map[string]ManifestItem, len(actual.Items))
 	for _, item := range actual.Items {
+		if _, exists := actualByRelative[item.Relative]; exists {
+			return fmt.Errorf("duplicate manifest entry %q", item.Relative)
+		}
 		actualByRelative[item.Relative] = item
 	}
+	seen := make(map[string]bool, len(expected.Items))
 	for _, wanted := range expected.Items {
+		if seen[wanted.Relative] {
+			return fmt.Errorf("duplicate source entry %q", wanted.Relative)
+		}
+		seen[wanted.Relative] = true
 		got, ok := actualByRelative[wanted.Relative]
 		if !ok {
 			return fmt.Errorf("missing %q", wanted.Relative)
@@ -414,8 +440,8 @@ func CompareManifests(expected, actual Manifest, ignoreModified bool) error {
 		if wanted.Mode.Type() != got.Mode.Type() || (wanted.Mode.IsRegular() && wanted.Size != got.Size) || wanted.LinkTarget != got.LinkTarget || wanted.SHA256 != got.SHA256 {
 			return fmt.Errorf("content mismatch %q", wanted.Relative)
 		}
-		if !ignoreModified && wanted.ModifiedNS != got.ModifiedNS {
-			return fmt.Errorf("mtime changed %q", wanted.Relative)
+		if !ignoreModified && (wanted.ModifiedNS != got.ModifiedNS || wanted.Mode.Perm() != got.Mode.Perm()) {
+			return fmt.Errorf("source metadata changed %q", wanted.Relative)
 		}
 	}
 	return nil

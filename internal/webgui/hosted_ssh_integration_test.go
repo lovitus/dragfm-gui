@@ -66,7 +66,8 @@ func waitForJob(t *testing.T, app *App, id string, expected string) JobUpdateMod
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("job %s did not reach %s", id, expected)
+	snapshot, _ := app.JobSnapshot()
+	t.Fatalf("job %s did not reach %s; last snapshot: %+v", id, expected, snapshot)
 	return JobUpdateModel{}
 }
 
@@ -97,6 +98,15 @@ func TestHostedSSHQueueAndHistory(t *testing.T) {
 	invalidConcurrency := false
 	app.mu.Lock()
 	app.eventSink = func(name string, value any) {
+		if name == "challenge" {
+			// The isolated fixture explicitly accepts listener/sudo/Hans
+			// confirmations just as a user would in the native window. SSH
+			// identities stay pinned; no password or host-key acceptance here.
+			challenge := value.(ChallengeModel)
+			accepted := challenge.Kind == "confirm" || (challenge.Kind == "password" && strings.Contains(challenge.Title, "提权"))
+			go func() { _ = app.ResolveChallenge(challenge.ID, accepted, "", false) }()
+			return
+		}
 		if name != "job:update" {
 			return
 		}

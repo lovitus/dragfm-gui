@@ -285,6 +285,9 @@ func (a *App) runSOCKSPool(ctx context.Context, operation transfer.Operation, pr
 				for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream} {
 					if method == strategy.EncryptedStream {
 						if runErr := a.runAgentStream(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], &proxy, nil, ""); runErr != nil {
+							if !transfer.Retryable(runErr) {
+								return runErr
+							}
 							failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.config.Name, direction, method, elevated, runErr))
 							continue
 						}
@@ -292,6 +295,9 @@ func (a *App) runSOCKSPool(ctx context.Context, operation transfer.Operation, pr
 						return nil
 					}
 					if runErr := a.runAgentMethod(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], &proxy, nil, method); runErr != nil {
+						if !transfer.Retryable(runErr) {
+							return runErr
+						}
 						failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.config.Name, direction, method, elevated, runErr))
 						continue
 					}
@@ -387,6 +393,9 @@ func (a *App) runJumpPool(ctx context.Context, operation transfer.Operation, pre
 				for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream} {
 					if method == strategy.EncryptedStream {
 						if runErr := a.runAgentStream(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], nil, candidate.hops, ""); runErr != nil {
+							if !transfer.Retryable(runErr) {
+								return runErr
+							}
 							failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.host.Name, direction, method, elevated, runErr))
 							continue
 						}
@@ -394,6 +403,9 @@ func (a *App) runJumpPool(ctx context.Context, operation transfer.Operation, pre
 						return nil
 					}
 					if runErr := a.runAgentMethod(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], nil, candidate.hops, method); runErr != nil {
+						if !transfer.Retryable(runErr) {
+							return runErr
+						}
 						failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.host.Name, direction, method, elevated, runErr))
 						continue
 					}
@@ -454,6 +466,9 @@ func (a *App) runHans(ctx context.Context, operation transfer.Operation, preflig
 	var failures []error
 	for _, candidate := range roles {
 		if err := a.runHansRole(ctx, operation, preflight, candidate.server, candidate.client, candidate.serverArch, candidate.clientArch, candidate.direction, candidate.serverSudo, candidate.clientSudo); err != nil {
+			if !transfer.Retryable(err) {
+				return err
+			}
 			failures = append(failures, fmt.Errorf("server=%s: %w", candidate.server.Name(), err))
 			continue
 		}
@@ -1160,7 +1175,12 @@ func runRsync(ctx context.Context, remote *endpoint.Remote, operation transfer.O
 	return finishAcceleratedMove(ctx, operation, before, "rsync")
 }
 
-func finishAcceleratedMove(ctx context.Context, operation transfer.Operation, before transfer.Manifest, method string) error {
+func finishAcceleratedMove(ctx context.Context, operation transfer.Operation, before transfer.Manifest, method string) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			retErr = transfer.PreserveSource(retErr)
+		}
+	}()
 	if !operation.Move {
 		return nil
 	}
@@ -1178,6 +1198,9 @@ func finishAcceleratedMove(ctx context.Context, operation transfer.Operation, be
 	if err := transfer.CompareManifests(before, afterTarget, true); err != nil {
 		return fmt.Errorf("%s 后 SHA-256 校验失败，源已保留: %w", method, err)
 	}
+	if err := transfer.VerifySourceUnchanged(ctx, operation.Source, operation.SourcePath, before); err != nil {
+		return err
+	}
 	return operation.Source.Remove(ctx, operation.SourcePath, before.Items[0].Mode.IsDir())
 }
 
@@ -1188,7 +1211,12 @@ func snapshotForAgentAttempt(ctx context.Context, operation transfer.Operation, 
 	return transfer.Snapshot(ctx, operation.Source, operation.SourcePath, operation.Move)
 }
 
-func finishAcceleratedMoveWithAgentTarget(ctx context.Context, operation transfer.Operation, before transfer.Manifest, method string, targetAgent *remoteagent.Session) error {
+func finishAcceleratedMoveWithAgentTarget(ctx context.Context, operation transfer.Operation, before transfer.Manifest, method string, targetAgent *remoteagent.Session) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			retErr = transfer.PreserveSource(retErr)
+		}
+	}()
 	if !operation.Move {
 		return nil
 	}
@@ -1206,10 +1234,18 @@ func finishAcceleratedMoveWithAgentTarget(ctx context.Context, operation transfe
 	if err := transfer.CompareManifests(before, afterTarget, true); err != nil {
 		return fmt.Errorf("%s 后 SHA-256 校验失败，源已保留: %w", method, err)
 	}
+	if err := transfer.VerifySourceUnchanged(ctx, operation.Source, operation.SourcePath, before); err != nil {
+		return err
+	}
 	return operation.Source.Remove(ctx, operation.SourcePath, before.Items[0].Mode.IsDir())
 }
 
-func finishAcceleratedMoveWithAgentSource(ctx context.Context, operation transfer.Operation, before transfer.Manifest, method string, sourceAgent *remoteagent.Session) error {
+func finishAcceleratedMoveWithAgentSource(ctx context.Context, operation transfer.Operation, before transfer.Manifest, method string, sourceAgent *remoteagent.Session) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			retErr = transfer.PreserveSource(retErr)
+		}
+	}()
 	if !operation.Move {
 		return nil
 	}
@@ -1226,6 +1262,16 @@ func finishAcceleratedMoveWithAgentSource(ctx context.Context, operation transfe
 	}
 	if err := transfer.CompareManifests(before, afterTarget, true); err != nil {
 		return fmt.Errorf("%s 后 SHA-256 校验失败，源已保留: %w", method, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	finalSource, err := sourceAgent.Manifest(operation.SourcePath)
+	if err != nil {
+		return err
+	}
+	if err := transfer.CompareManifests(before, finalSource, false); err != nil {
+		return errors.Join(transfer.ErrSourceChanged, err)
 	}
 	return sourceAgent.RemovePath(operation.SourcePath, before.Items[0].Mode.IsDir())
 }
