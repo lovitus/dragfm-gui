@@ -1,0 +1,55 @@
+name: apply-reviewed-hardening
+on:
+  pull_request:
+    paths: ['.github/workflows/apply-reviewed-hardening.yml']
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: github.event.pull_request.number == 1 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Wire the reviewed scoped extractor and bounded helper lifecycle
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('internal/agentservice/service.go')
+          s=p.read_text(); start=s.index('func receiveArchiveWithOwnership('); end=s.index('func ephemeralCertificate(',start)
+          s=s[:start]+s[end:]; p.write_text(s)
+          p=Path('internal/remoteagent/remoteagent.go')
+          s=p.read_text().replace('\tssh       *ssh.Session\n','\tssh       io.Closer\n\tctx       context.Context\n\tdone      chan struct{}\n')
+          s=s.replace('\t"golang.org/x/crypto/ssh"\n','')
+          a=s.index('func (s *Session) CallContext('); b=s.index('func (s *Session) Listen(',a)
+          old=s[a:b].replace('func (s *Session) CallContext(', 'func (s *Session) call(')
+          before='\ts.callMu.Lock()\n\tdefer s.callMu.Unlock()\n\tstopCancellation := context.AfterFunc(ctx, func() { _ = s.ssh.Close() })\n\tdefer stopCancellation()'
+          assert old.count(before)==1
+          old=old.replace(before, '\tif err := ctx.Err(); err != nil { return nil, err }\n\tstopCancellation := context.AfterFunc(ctx, s.abortTransport)\n\tdefer stopCancellation()\n\ts.callMu.Lock()\n\tdefer s.callMu.Unlock()\n\tif err := ctx.Err(); err != nil { return nil, err }')
+          s=s[:a]+old+s[b:]
+          s=s.replace('\tvar stderr bytes.Buffer\n\tsshSession.Stderr = &stderr', '\tvar stderr helperOutput\n\tsshSession.Stderr = &stderr')
+          s=s.replace('\tprotocol, err := agentproto.Client(stdout, stdin)', '\thandshakeCtx, stopDeadline := context.WithTimeout(ctx, 15*time.Second)\n\tstopHandshake := context.AfterFunc(handshakeCtx, func() { _ = sshSession.Close() })\n\tprotocol, err := agentproto.Client(stdout, stdin)\n\tstopHandshake()\n\tstopDeadline()')
+          s=s.replace('stdin: stdin, elevated: elevated}', 'stdin: stdin, elevated: elevated, ctx: ctx, done: make(chan struct{})}')
+          s=s.replace('\t\t<-ctx.Done()\n\t\t_ = session.Close()', '\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\t_ = session.Close()\n\t\tcase <-session.done:\n\t\t}')
+          a=s.index('func (s *Session) Close()'); b=s.index('func CleanupStale(',a)
+          s=s[:a]+s[b:]; p.write_text(s)
+      - name: Format and commit only the six reviewed source files
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          files=(internal/agentservice/service.go internal/agentservice/archive_receive.go internal/agentservice/archive_receive_test.go internal/remoteagent/remoteagent.go internal/remoteagent/lifecycle.go internal/remoteagent/lifecycle_test.go)
+          gofmt -w "${files[@]}"
+          git diff --check
+          git add "${files[@]}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(security): scope archive writes and bound remote helper cancellation'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
