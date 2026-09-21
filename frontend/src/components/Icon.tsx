@@ -1,12 +1,13 @@
 import type { SVGProps } from 'react'
 
-export type IconName = 'folder' | 'file' | 'link' | 'up' | 'refresh' | 'trash' | 'hash' | 'settings' | 'lock' | 'terminal' | 'copy' | 'move' | 'close' | 'check' | 'alert' | 'stop'
+export type IconName = 'folder' | 'file' | 'link' | 'up' | 'chevron' | 'refresh' | 'trash' | 'hash' | 'settings' | 'lock' | 'terminal' | 'copy' | 'move' | 'close' | 'check' | 'alert' | 'stop'
 
 const paths: Record<IconName, React.ReactNode> = {
   folder: <path d="M3.5 5.5h5l1.7 2h10.3v10.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7V5.5Z" />,
   file: <path d="M6 3.5h7l5 5V20H6V3.5Zm7 0v5h5" />,
   link: <><path d="M9.5 14.5 14.5 9.5"/><path d="M7.3 16.7 5.8 18.2a3 3 0 0 1-4.2-4.2l3.2-3.2A3 3 0 0 1 9 10.7M14.7 7.3l1.5-1.5a3 3 0 1 1 4.2 4.2l-3.2 3.2a3 3 0 0 1-4.2.1"/></>,
   up: <path d="m5 14 7-7 7 7M12 7v13" />,
+  chevron: <path d="m9 5 7 7-7 7" />,
   refresh: <><path d="M19 8V4l-2 2a8 8 0 1 0 2.3 8"/><path d="M19 4h-4"/></>,
   trash: <><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13M10 10v7M14 10v7"/></>,
   hash: <path d="M9 3 7 21M17 3l-2 18M4 9h16M3 15h16" />,
