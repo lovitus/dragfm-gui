@@ -1,0 +1,41 @@
+name: apply-deep-review
+on:
+  pull_request:
+    paths: ['.github/workflows/apply-deep-review.yml']
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: github.repository == 'lovitus/dragfm-gui' && github.event.pull_request.number == 1 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Apply the exact reviewed source patch
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, lzma, subprocess
+          packed = b''.join(Path(f'.ci-review/part{i}.bin').read_bytes() for i in range(1, 5))
+          patch = lzma.decompress(packed)
+          assert len(patch) == 111922
+          assert hashlib.sha256(patch).hexdigest() == '7fb23d2b9e173cc0ec9d9709dce56550855c6a1081b1f39cde7399ce9a9a74be'
+          subprocess.run(['git', 'apply', '--index', '-'], input=patch, check=True)
+          subprocess.run(['git', 'rm', '-r', '.ci-review'], check=True)
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+      - name: Commit reviewed sources without rewriting concurrent work
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          actual=$(git ls-remote origin "refs/heads/$HEAD_BRANCH" | cut -f1)
+          test "$actual" = "$EXPECTED_HEAD"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: harden transfers and lifecycle; exercise all routed transports'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
