@@ -21,15 +21,7 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
 	defer cancel()
-	service := agentservice.NewWithContext(ctx)
-	for {
-		var request agentproto.Request
-		if err := connection.Receive(&request); err != nil {
-			return
-		}
-		response := service.Handle(request)
-		if err := connection.Send(response); err != nil {
-			return
-		}
-	}
+	cleanup := agentservice.OwnInstallation()
+	defer cleanup()
+	_ = agentservice.Serve(ctx, connection)
 }

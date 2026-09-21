@@ -27,15 +27,16 @@ type paneState struct {
 }
 
 type terminalSession struct {
-	id        string
-	pane      PaneID
-	pty       endpoint.PTYSession
-	cancel    context.CancelFunc
-	writeMu   sync.Mutex
-	startOnce sync.Once
-	endpoint  endpoint.Endpoint
-	ctx       context.Context
-	busy      atomic.Bool
+	id          string
+	pane        PaneID
+	pty         endpoint.PTYSession
+	cancel      context.CancelFunc
+	writeMu     sync.Mutex
+	startOnce   sync.Once
+	endpoint    endpoint.Endpoint
+	ctx         context.Context
+	busy        atomic.Bool
+	cwdSequence atomic.Uint64
 }
 
 type App struct {

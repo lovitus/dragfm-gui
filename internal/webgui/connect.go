@@ -35,7 +35,7 @@ func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName 
 	}
 	a.mu.RLock()
 	current := a.panes[paneID]
-	if current != nil && current.endpoint != nil && current.name == name {
+	if current != nil && current.endpoint != nil && current.name == name && endpointOpen(current.endpoint) {
 		copy := *current
 		copy.generation = generation
 		a.mu.RUnlock()
@@ -429,4 +429,11 @@ func authenticationHop(err error) int {
 func isAuthenticationError(err error) bool {
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "unable to authenticate") || strings.Contains(text, "no ssh authentication methods") || strings.Contains(text, "no supported methods remain")
+}
+
+func endpointOpen(value endpoint.Endpoint) bool {
+	if remote, ok := value.(interface{ IsClosed() bool }); ok {
+		return !remote.IsClosed()
+	}
+	return true
 }

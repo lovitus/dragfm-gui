@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lovitus/dragfm-gui/internal/filecommit"
 )
 
 type Local struct{}
@@ -112,11 +114,7 @@ func (l *Local) Rename(ctx context.Context, source, target string, overwrite boo
 		return err
 	}
 	if !overwrite {
-		if _, err := os.Lstat(target); err == nil {
-			return fs.ErrExist
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
+		return filecommit.NoReplace(source, target)
 	}
 	return os.Rename(source, target)
 }
@@ -242,6 +240,7 @@ func localMachineID() string {
 			}
 		}
 	}
-	host, _ := os.Hostname()
-	return host
+	// Never match a remote hostname. The process-local fallback still identifies
+	// both local panes on platforms without /etc/machine-id.
+	return fallbackLocalIdentity()
 }

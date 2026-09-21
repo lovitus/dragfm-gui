@@ -99,6 +99,12 @@ func Execute(ctx context.Context, attempts []Attempt, approve Approval, emit fun
 		if err == nil {
 			return nil
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
 		var retry interface{ Retryable() bool }
 		if errors.As(err, &retry) && !retry.Retryable() {
 			return err

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { api, onEvent } from '../api'
+import { CWDGate } from '../cwdGate'
 import { isFinished, mergeJobUpdates } from '../jobState'
 import type { Bootstrap, DirectoryListing, DropPreview, FileEntry, HistoryEntry, JobUpdate, PaneID } from '../types'
 import type { PaneModel } from './FilePane'
@@ -45,6 +46,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
   const modelsRef = useRef(models)
   modelsRef.current = models
   const revisions = useRef<Record<PaneID, number>>({ left: 0, right: 0 })
+  const cwdGates = useRef({ left: new CWDGate(), right: new CWDGate() })
   const listingInFlight = useRef<Record<PaneID, boolean>>({ left: false, right: false })
   const [jobs, setJobs] = useState<JobUpdate[]>([])
   const [activity, setActivity] = useState<JobUpdate[]>([])
@@ -62,10 +64,12 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     catch (reason) { setOperationError(String(reason)); return false }
   }, [])
 
-  const load = useCallback(async (pane: PaneID, path?: string, endpoint?: string, preserveSelection = false) => {
+  const load = useCallback(async (pane: PaneID, path?: string, endpoint?: string, preserveSelection = false, fromTerminal = false) => {
     // A completion refresh must not replace a newer user navigation with
     // the old, still-rendered directory while its request is in flight.
     if (path === undefined && endpoint === undefined && listingInFlight.current[pane]) return
+    const userNavigation = !fromTerminal && (path !== undefined || endpoint !== undefined)
+    if (userNavigation) cwdGates.current[pane].begin()
     listingInFlight.current[pane] = true
     const current = modelsRef.current[pane]
     const revision = ++revisions.current[pane]
@@ -75,6 +79,10 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     try {
       const listing = await api.list(pane, requestedEndpoint, requestedPath)
       if (revision !== revisions.current[pane]) return
+      if (userNavigation) cwdGates.current[pane].resolve(listing.path, current.listing.path)
+      // Publish the authoritative location before React commits its render;
+      // a prompt/refresh arriving in that interval must not reload the old path.
+      modelsRef.current = { ...modelsRef.current, [pane]: { ...modelsRef.current[pane], listing } }
       setModels((old) => {
         // Preserve the latest selection, including a click made while this
         // background listing was pending. Never retain a deleted/stale entry.
@@ -84,6 +92,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
       })
     } catch (reason) {
       if (revision !== revisions.current[pane]) return
+      if (userNavigation) cwdGates.current[pane].clear()
       setModels((old) => ({ ...old, [pane]: { ...old[pane], loading: false, error: String(reason) } }))
     } finally {
       if (revision === revisions.current[pane]) listingInFlight.current[pane] = false
@@ -163,6 +172,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
   }, [load])
 
   const changeEndpoint = async (pane: PaneID, endpoint: string) => {
+    cwdGates.current[pane].clear()
     listingInFlight.current[pane] = true
     const peer: PaneID = pane === 'left' ? 'right' : 'left'
     const revision = ++revisions.current[pane]
@@ -249,10 +259,11 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
           dropTarget={dropTarget}
           onFocus={() => setActivePane(pane)}
           onNavigate={(path, fromTerminal) => {
+            if (fromTerminal && !cwdGates.current[pane].accept(path)) return
             // An unchanged shell prompt is a refresh, not new navigation. In
             // particular, it must not supersede an in-flight Backspace/List.
             if (fromTerminal && path === modelsRef.current[pane].listing.path) void load(pane, undefined, undefined, true)
-            else void load(pane, path)
+            else void load(pane, path, undefined, false, Boolean(fromTerminal))
           }}
           onEndpoint={(endpoint) => void changeEndpoint(pane, endpoint)}
           onRefresh={() => void load(pane)}

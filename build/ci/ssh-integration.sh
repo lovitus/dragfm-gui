@@ -73,8 +73,8 @@ export DRAGFM_E2E_NCAT=1
 export DRAGFM_E2E_HANS=1
 export DRAGFM_E2E_SUDO=1
 set +e
-go test -mod=vendor -tags=integration -race -count=1 -timeout=12m -json ./internal/webgui \
-  -run 'Test(RemoteTransferMethodsOnHostedFixtures|HostedSSHQueueAndHistory|HostedNonRootSudoTransfers)' \
+go test -mod=vendor -tags=integration -race -count=1 -timeout=20m -json ./internal/webgui \
+  -run 'Test(RemoteTransferMethodsOnHostedFixtures|HostedSSHQueueAndHistory|HostedNonRootSudoTransfers|HostedReviewedTransportMatrix|HostedReviewedHansRolesAndMethods)' \
   2>&1 | tee test-results/ssh-integration.jsonl
 ssh_status=${PIPESTATUS[0]}
 set -e

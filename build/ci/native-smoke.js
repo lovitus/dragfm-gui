@@ -83,7 +83,7 @@
   try {
     await wait('native Wails bindings', () => window.go?.webgui?.App && window.runtime?.EventsOn);
     const api = window.go.webgui.App;
-    window.runtime.EventsOn('terminal:cwd', (event) => { cwd[event.pane] = event; });
+    window.runtime.EventsOn('terminal:cwd', (event) => { const previous = cwd[event.pane]; if (!previous || previous.session !== event.session || (event.sequence || 0) > (previous.sequence || 0)) cwd[event.pane] = event; });
     window.runtime.EventsOn('terminal:data', (event) => { terminalOutput[event.pane] = ((terminalOutput[event.pane] || '') + atob(event.data)).slice(-32768); });
     window.runtime.EventsOn('job:update', (event) => { events.push(event); if (events.length > 2000) events.shift(); });
     window.runtime.EventsOn('challenge', (event) => {
@@ -228,6 +228,6 @@
     let message = String(error);
     if (plan?.password) message = message.replaceAll(plan.password, '[redacted]');
     message = message.replace(/-----BEGIN [\s\S]*?PRIVATE KEY-----[\s\S]*?-----END [\s\S]*?PRIVATE KEY-----/g, '[private key redacted]');
-    window.runtime?.EventsEmit('__dragfm_native_smoke_result__', JSON.stringify({ success: false, phase: plan?.phase, stage, checks, error: message, leftPath: pathInput('left')?.value, rightPath: pathInput('right')?.value, leftCWD: cwd.left?.path, rightCWD: cwd.right?.path, active: document.querySelector('.file-pane.active')?.dataset.pane, modalCount: document.querySelectorAll('.modal-backdrop').length }));
+    window.runtime?.EventsEmit('__dragfm_native_smoke_result__', JSON.stringify({ success: false, phase: plan?.phase, stage, checks, error: message, terminalTail: {left: terminalOutput.left?.slice(-3000), right: terminalOutput.right?.slice(-3000)}, leftPath: pathInput('left')?.value, rightPath: pathInput('right')?.value, leftCWD: cwd.left?.path, rightCWD: cwd.right?.path, active: document.querySelector('.file-pane.active')?.dataset.pane, modalCount: document.querySelectorAll('.modal-backdrop').length }));
   }
 })();

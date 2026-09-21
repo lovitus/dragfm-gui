@@ -177,7 +177,7 @@ func (a *App) pumpTerminal(session *terminalSession) {
 		}
 		a.mu.Unlock()
 		a.requestSave()
-		a.emit("terminal:cwd", terminalCWDModel{Session: session.id, Pane: session.pane, Path: directory})
+		a.emit("terminal:cwd", terminalCWDModel{Session: session.id, Pane: session.pane, Path: directory, Sequence: session.cwdSequence.Add(1)})
 	})
 	if closer, ok := filtered.(io.Closer); ok {
 		defer closer.Close()

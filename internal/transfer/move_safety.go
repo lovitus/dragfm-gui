@@ -39,6 +39,9 @@ func VerifySourceUnchanged(ctx context.Context, source endpoint.Endpoint, root s
 
 // Retryable reports whether a failed attempt may safely fall through to a new route.
 func Retryable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	var marker interface{ Retryable() bool }
 	return !errors.As(err, &marker) || marker.Retryable()
 }

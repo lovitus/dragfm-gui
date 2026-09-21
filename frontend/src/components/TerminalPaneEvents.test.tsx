@@ -41,3 +41,13 @@ it('ignores delayed duplicate cwd prompts without losing genuine shell navigatio
   expect(onCWD).toHaveBeenLastCalledWith('/old')
   expect(changeDirectory).toHaveBeenCalledTimes(1)
 })
+
+it('ignores reordered native cwd events after a newer acknowledgement', async () => {
+  const onCWD = vi.fn()
+  render(<TerminalPane pane="left" path="/new" active={false} onCWD={onCWD} />)
+  await waitFor(() => expect(ready).toHaveBeenCalled())
+  act(() => listeners.get('terminal:cwd')!({pane: 'left', session: 'session', path: '/new', sequence: 2}))
+  act(() => listeners.get('terminal:cwd')!({pane: 'left', session: 'session', path: '/old', sequence: 1}))
+  expect(onCWD).toHaveBeenCalledTimes(1)
+  expect(onCWD).toHaveBeenCalledWith('/new')
+})

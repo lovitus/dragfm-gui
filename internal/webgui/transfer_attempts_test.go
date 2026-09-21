@@ -117,9 +117,11 @@ func TestLocalRemoteAttemptOrderStartsWithRsyncThenSCP(t *testing.T) {
 		{strategy.SourcePush, true, strategy.Rsync, strategy.SourceSudoRisk},
 		{strategy.SourcePush, true, strategy.SCP, strategy.SourceSudoRisk},
 		{strategy.SourcePush, true, strategy.EncryptedStream, strategy.SourceSudoRisk},
+		{strategy.SourcePush, true, strategy.NcatTar, strategy.SourceSudoRisk},
 		{strategy.TargetPull, true, strategy.Rsync, strategy.TargetSudoRisk},
 		{strategy.TargetPull, true, strategy.SCP, strategy.TargetSudoRisk},
 		{strategy.TargetPull, true, strategy.EncryptedStream, strategy.TargetSudoRisk},
+		{strategy.TargetPull, true, strategy.NcatTar, strategy.TargetSudoRisk},
 	}
 	if len(plan) != len(wanted) {
 		t.Fatalf("plan length=%d want=%d: %#v", len(plan), len(wanted), plan)

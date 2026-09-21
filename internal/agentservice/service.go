@@ -24,15 +24,16 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/flyssh/flyssh/pkg/connector"
 	"github.com/flyssh/flyssh/pkg/socks"
 	flytransfer "github.com/flyssh/flyssh/pkg/transfer"
+	"github.com/lovitus/dragfm-gui/internal/activity"
 	"github.com/lovitus/dragfm-gui/internal/agentproto"
 	"github.com/lovitus/dragfm-gui/internal/agentroute"
+	"github.com/lovitus/dragfm-gui/internal/filecommit"
 	"github.com/lovitus/dragfm-gui/internal/rsyncbridge"
 )
 
@@ -41,6 +42,7 @@ type Service struct {
 	jobs      map[string]*listenerJob
 	processes map[string]*processJob
 	ctx       context.Context
+	partials  map[string]*ownedPartial
 }
 
 type listenerJob struct {
@@ -48,6 +50,7 @@ type listenerJob struct {
 	done     chan error
 	port     int
 	pin      string
+	address  string
 }
 
 func New() *Service {
@@ -69,7 +72,26 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		return response
 	}
 	var err error
+	var incoming string
 	switch request.Action {
+	case "listen-receive", "connect-receive":
+		incoming = request.Options["path"]
+	case "scp-download", "rsync-download":
+		incoming = request.Options["target"]
+	case "track-partial":
+		incoming = request.Options["path"]
+	}
+	if incoming != "" {
+		if err = s.trackPartial(incoming); err != nil {
+			response.OK = false
+			response.Error = err.Error()
+			return response
+		}
+	}
+	switch request.Action {
+	case "track-partial":
+	case "forget-partial":
+		s.forgetPartial(request.Options["path"])
 	case "probe":
 		response.Values["os"], response.Values["arch"] = runtime.GOOS, runtime.GOARCH
 	case "sha256":
@@ -80,7 +102,7 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		if err == nil {
 			response.Values["port"] = strconv.Itoa(job.port)
 			response.Values["pin"] = job.pin
-			response.Values["addresses"] = strings.Join(localAddresses(), ",")
+			response.Values["addresses"] = job.address
 		}
 	case "connect-send":
 		err = connect(s.ctx, request, true)
@@ -103,6 +125,7 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 	case "process-stop":
 		err = s.stopProcess(request.Options["job"])
 	case "remove-owned-temp":
+		s.Close()
 		err = removeOwnedTemp(request.Options["path"])
 	case "cleanup-stale-temps":
 		seconds, parseErr := strconv.ParseInt(request.Options["older_seconds"], 10, 64)
@@ -113,6 +136,9 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		}
 	case "path-commit":
 		err = commitPath(request.Options["partial"], request.Options["target"], request.Options["overwrite"] == "true")
+		if err == nil {
+			s.forgetPartial(request.Options["partial"])
+		}
 	case "path-remove":
 		err = removePath(request.Options["path"], request.Options["directory"] == "true")
 	case "filesystem-manifest":
@@ -234,7 +260,7 @@ func commitPathInternal(partial, target string, overwrite bool) error {
 	}
 	targetInfo, targetErr := os.Lstat(target)
 	if errors.Is(targetErr, os.ErrNotExist) {
-		return os.Rename(partial, target)
+		return filecommit.NoReplace(partial, target)
 	}
 	if targetErr != nil {
 		return targetErr
@@ -282,75 +308,17 @@ func runRsync(ctx context.Context, request agentproto.Request) error {
 	return rsyncbridge.Run(ctx, chain.Final(), direction, request.Options["source"], request.Options["target"])
 }
 
-func removeOwnedTemp(path string) error {
-	clean := filepath.Clean(path)
-	if filepath.Dir(clean) != "/tmp" || !strings.HasPrefix(filepath.Base(clean), ".dragfm-") {
-		return errors.New("refusing to remove unscoped temporary path")
-	}
-	marker := filepath.Join(clean, ".dragfm-owner-v1")
-	info, err := os.Lstat(marker)
-	if err != nil || !info.Mode().IsRegular() {
-		return errors.New("temporary ownership marker is missing")
-	}
-	return os.RemoveAll(clean)
-}
-
-type ownershipMarker struct {
-	Version int       `json:"version"`
-	Created time.Time `json:"created"`
-	Nonce   string    `json:"nonce"`
-}
-
-func cleanupOwnedTemps(root, keep string, olderThan time.Duration) error {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".dragfm-") {
-			continue
-		}
-		directory := filepath.Join(root, entry.Name())
-		if filepath.Clean(directory) == filepath.Clean(keep) {
-			continue
-		}
-		markerPath := filepath.Join(directory, ".dragfm-owner-v1")
-		info, statErr := os.Lstat(markerPath)
-		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-			continue
-		}
-		file, openErr := os.Open(markerPath)
-		if openErr != nil {
-			continue
-		}
-		data, readErr := io.ReadAll(io.LimitReader(file, 4097))
-		_ = file.Close()
-		var marker ownershipMarker
-		if readErr != nil || len(data) > 4096 || json.Unmarshal(data, &marker) != nil || marker.Version != 1 || marker.Nonce == "" || entry.Name() != ".dragfm-"+marker.Nonce || marker.Created.IsZero() || now.Sub(marker.Created) < olderThan {
-			continue
-		}
-		_ = os.RemoveAll(directory)
-	}
-	return nil
-}
-
 func tcpProbe(address string) (string, error) {
 	if address == "" {
 		return "", errors.New("probe address is empty")
 	}
-	values := make([]time.Duration, 0, 3)
-	for index := 0; index < 3; index++ {
-		started := time.Now()
-		connection, err := net.DialTimeout("tcp", address, 2*time.Second)
-		if err != nil {
-			return "", err
-		}
-		_ = connection.Close()
-		values = append(values, time.Since(started))
+	started := time.Now()
+	connection, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		return "", err
 	}
-	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
-	return strconv.FormatInt(values[1].Milliseconds(), 10), nil
+	_ = connection.Close()
+	return strconv.FormatInt(time.Since(started).Milliseconds(), 10), nil
 }
 
 func runSCP(ctx context.Context, request agentproto.Request) error {
@@ -363,6 +331,8 @@ func runSCP(ctx context.Context, request agentproto.Request) error {
 		return err
 	}
 	defer chain.Close()
+	stop := context.AfterFunc(ctx, func() { _ = chain.Close() })
+	defer stop()
 	direction := flytransfer.DirectionUpload
 	if request.Action == "scp-download" {
 		direction = flytransfer.DirectionDownload
@@ -391,12 +361,12 @@ func (s *Service) startListener(request agentproto.Request) (*listenerJob, error
 	if err != nil {
 		return nil, err
 	}
-	listener, err := tls.Listen("tcp", "0.0.0.0:0", &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13})
+	listener, address, err := listenDataAddress(request.Options["bind"])
 	if err != nil {
 		return nil, err
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	job := &listenerJob{listener: listener, done: make(chan error, 1), port: port, pin: pin}
+	job := &listenerJob{listener: listener, done: make(chan error, 1), port: port, pin: pin, address: address}
 	s.mu.Lock()
 	if _, exists := s.jobs[jobID]; exists {
 		s.mu.Unlock()
@@ -414,6 +384,7 @@ func (s *Service) startListener(request agentproto.Request) (*listenerJob, error
 			job.done <- acceptErr
 			return
 		}
+		connection = tls.Server(activity.Conn(s.ctx, connection), &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13})
 		defer connection.Close()
 		stopConnection := context.AfterFunc(s.ctx, func() { _ = connection.Close() })
 		defer stopConnection()
@@ -422,9 +393,17 @@ func (s *Service) startListener(request agentproto.Request) (*listenerJob, error
 			return
 		}
 		if request.Action == "listen-receive" {
-			job.done <- receiveArchiveWithOwnership(connection, path, request.Options["preserve_owner"] == "true")
+			err := receiveArchiveWithOwnership(connection, path, request.Options["preserve_owner"] == "true")
+			if err == nil && request.Options["ack"] == "true" {
+				_, err = connection.Write([]byte{1})
+			}
+			job.done <- err
 		} else {
-			job.done <- sendArchive(connection, path)
+			err := sendArchive(connection, path)
+			if err == nil && request.Options["ack"] == "true" {
+				err = readArchiveReceipt(connection)
+			}
+			job.done <- err
 		}
 	}()
 	return job, nil
@@ -488,6 +467,18 @@ func connect(ctx context.Context, request agentproto.Request, sending bool) erro
 	if routeChain != nil {
 		defer routeChain.Close()
 	}
+	if carrier := request.Options["carrier"]; carrier != "" {
+		if carrier != "ncat" {
+			_ = raw.Close()
+			return errors.New("unsupported data carrier")
+		}
+		raw, err = ncatCarrier(ctx, raw)
+		if err != nil {
+			return err
+		}
+	}
+	raw = activity.Conn(ctx, raw)
+	_ = raw.SetDeadline(time.Now().Add(30 * time.Second))
 	stopConnection := context.AfterFunc(ctx, func() { _ = raw.Close() })
 	defer stopConnection()
 	connection := tls.Client(raw, &tls.Config{
@@ -515,10 +506,19 @@ func connect(ctx context.Context, request agentproto.Request, sending bool) erro
 	if _, err := io.ReadFull(connection, acknowledged[:]); err != nil || acknowledged[0] != 1 {
 		return errors.New("data-channel authentication failed")
 	}
+	_ = connection.SetDeadline(time.Time{})
 	if sending {
-		return sendArchive(connection, path)
+		err := sendArchive(connection, path)
+		if err == nil && request.Options["ack"] == "true" {
+			err = readArchiveReceipt(connection)
+		}
+		return err
 	}
-	return receiveArchiveWithOwnership(connection, path, request.Options["preserve_owner"] == "true")
+	err = receiveArchiveWithOwnership(connection, path, request.Options["preserve_owner"] == "true")
+	if err == nil && request.Options["ack"] == "true" {
+		_, err = connection.Write([]byte{1})
+	}
+	return err
 }
 
 func dialSOCKSContext(ctx context.Context, proxyAddress, targetAddress, username, password string) (net.Conn, error) {
@@ -668,4 +668,15 @@ func fileSHA256(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func readArchiveReceipt(connection io.Reader) error {
+	var receipt [1]byte
+	if _, err := io.ReadFull(connection, receipt[:]); err != nil {
+		return fmt.Errorf("receiver did not acknowledge complete archive: %w", err)
+	}
+	if receipt[0] != 1 {
+		return errors.New("receiver rejected archive")
+	}
+	return nil
 }

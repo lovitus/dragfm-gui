@@ -17,6 +17,7 @@ import (
 
 	"github.com/flyssh/flyssh/pkg/connector"
 	flytransfer "github.com/flyssh/flyssh/pkg/transfer"
+	"github.com/lovitus/dragfm-gui/internal/activity"
 	"github.com/lovitus/dragfm-gui/internal/agentroute"
 	"github.com/lovitus/dragfm-gui/internal/config"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
@@ -64,7 +65,7 @@ func (a *App) transferAttemptsWithSudoProbe(operation transfer.Operation, prefli
 					}
 				case strategy.NcatTar:
 					descriptor.Run = func(ctx context.Context) error {
-						return runNcatTar(ctx, operation, descriptor.Direction)
+						return a.runAgentStreamWithCarrier(ctx, operation, preflight, descriptor.Direction, descriptor.Elevated, remoteSudo[descriptor.Direction], nil, nil, "", "ncat")
 					}
 				}
 				attempts = append(attempts, descriptor)
@@ -118,12 +119,12 @@ func directRemotePlan(preflight transfer.PreflightReport, privateHosts bool) []s
 				}
 				attempts = append(attempts, strategy.Attempt{Tier: strategy.Direct, Direction: direction, Elevated: elevated, Method: method, Risk: methodRisk})
 			}
-			if !elevated && preflight.SourceCapabilities.Tools["ncat"] && preflight.TargetCapabilities.Tools["ncat"] {
-				ncatRisk := strategy.PlaintextRisk
-				if privateHosts {
+			if preflight.SourceCapabilities.Tools["ncat"] && preflight.TargetCapabilities.Tools["ncat"] {
+				ncatRisk := risk
+				if !elevated {
 					ncatRisk = strategy.ListenRisk
 				}
-				attempts = append(attempts, strategy.Attempt{Tier: strategy.Direct, Direction: direction, Method: strategy.NcatTar, Risk: ncatRisk})
+				attempts = append(attempts, strategy.Attempt{Tier: strategy.Direct, Direction: direction, Elevated: elevated, Method: strategy.NcatTar, Risk: ncatRisk})
 			}
 		}
 	}
@@ -164,7 +165,23 @@ func (a *App) runAgentMethod(ctx context.Context, operation transfer.Operation, 
 	if err != nil {
 		return err
 	}
-	defer cleanupAgent()
+	var receiver *remoteagent.Session
+	var cleanupReceiver func()
+	defer func() {
+		cleanupAgent()
+		if cleanupReceiver != nil {
+			cleanupReceiver()
+		}
+	}()
+	if direction == strategy.SourcePush {
+		receiver, cleanupReceiver, err = a.startTransferAgent(ctx, target, preflight.TargetCapabilities.Architecture, false, "")
+		if err != nil {
+			return err
+		}
+		if _, err = receiver.CallContext(ctx, "track-partial", map[string]string{"path": remoteTarget}, nil); err != nil {
+			return err
+		}
+	}
 	before, err := snapshotForAgentAttempt(ctx, operation, elevated && direction == strategy.SourcePush, agent)
 	if err != nil {
 		return err
@@ -282,9 +299,9 @@ func (a *App) runSOCKSPool(ctx context.Context, operation transfer.Operation, pr
 					rtt = candidate.targetRTT
 				}
 				proxy := candidate.parsed
-				for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream} {
-					if method == strategy.EncryptedStream {
-						if runErr := a.runAgentStream(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], &proxy, nil, ""); runErr != nil {
+				for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream, strategy.NcatTar} {
+					if method == strategy.EncryptedStream || method == strategy.NcatTar {
+						if runErr := a.runAgentStreamWithCarrier(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], &proxy, nil, "", carrierForMethod(method)); runErr != nil {
 							if !transfer.Retryable(runErr) {
 								return runErr
 							}
@@ -335,18 +352,43 @@ func (a *App) runJumpPool(ctx context.Context, operation transfer.Operation, pre
 		return errors.New("端点主机配置不存在")
 	}
 	cached := a.cachedRelayLocked(sourceHost.ID, target.Name())
-	ids := make([]string, 0, len(a.sessionSSH)+1)
-	if cached != "" {
-		ids = append(ids, cached)
-	}
+	ids := make([]string, 0, len(a.sessionSSH))
 	for id := range a.sessionSSH {
 		if id != sourceHost.ID && id != targetHost.ID && id != cached {
 			ids = append(ids, id)
 		}
 	}
 	a.mu.RUnlock()
+	makeCandidate := func(id string) (probedRelay, bool) {
+		host := document.HostByID(id)
+		if host == nil || host.Disabled {
+			return probedRelay{}, false
+		}
+		route, err := a.routeForHost(*host)
+		if err != nil || len(route.Hops) == 0 {
+			return probedRelay{}, false
+		}
+		return probedRelay{host: *host, hops: route.Hops}, true
+	}
+	var failures []error
+	if cached != "" {
+		if candidate, ok := makeCandidate(cached); ok {
+			candidate.sourceOK, candidate.targetOK = true, true
+			activity.Report(ctx, "jump-cache-reuse", 0)
+			err := a.runRelayCandidate(ctx, operation, preflight, sudoPasswords, candidate)
+			if err == nil {
+				a.rememberRelay(sourceHost.ID, target.Name(), cached)
+				return nil
+			}
+			if !transfer.Retryable(err) {
+				return err
+			}
+			failures = append(failures, err)
+		}
+		a.forgetRelay(sourceHost.ID, target.Name())
+	}
 	if len(ids) == 0 {
-		return errors.New("没有已成功登录或缓存的 SSH 跳板会话")
+		return errors.Join(errors.New("没有其他已成功登录的 SSH 跳板会话"), errors.Join(failures...))
 	}
 	sourceAgent, err := remoteagent.Start(ctx, source, preflight.SourceCapabilities.Architecture)
 	if err != nil {
@@ -358,68 +400,64 @@ func (a *App) runJumpPool(ctx context.Context, operation transfer.Operation, pre
 		return err
 	}
 	defer targetAgent.Close()
+	sort.Strings(ids)
 	var candidates []probedRelay
 	for _, id := range ids {
-		host := document.HostByID(id)
-		if host == nil || host.Disabled {
+		probe, ok := makeCandidate(id)
+		if !ok {
 			continue
 		}
-		route, routeErr := a.routeForHost(*host)
-		if routeErr != nil || len(route.Hops) == 0 {
-			continue
-		}
-		route.SOCKS = nil
-		first := net.JoinHostPort(route.Hops[0].Host, fmt.Sprintf("%d", route.Hops[0].Port))
-		probe := probedRelay{host: *host, hops: route.Hops, cached: id == cached}
+		first := net.JoinHostPort(probe.hops[0].Host, fmt.Sprint(probe.hops[0].Port))
+		activity.Report(ctx, "jump-probe", 0)
 		probe.sourceRTT, probe.sourceOK = probeTCPMedian(sourceAgent, first)
 		probe.targetRTT, probe.targetOK = probeTCPMedian(targetAgent, first)
 		if probe.sourceOK || probe.targetOK {
 			candidates = append(candidates, probe)
 		}
 	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].cached != candidates[j].cached {
-			return candidates[i].cached
-		}
-		return bestRelayRTT(candidates[i]) < bestRelayRTT(candidates[j])
-	})
-	var failures []error
+	sort.SliceStable(candidates, func(i, j int) bool { return bestRelayRTT(candidates[i]) < bestRelayRTT(candidates[j]) })
 	for _, candidate := range candidates {
-		for _, elevated := range []bool{false, true} {
-			for _, direction := range []strategy.Direction{strategy.SourcePush, strategy.TargetPull} {
-				if direction == strategy.SourcePush && !candidate.sourceOK || direction == strategy.TargetPull && !candidate.targetOK {
-					continue
-				}
-				for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream} {
-					if method == strategy.EncryptedStream {
-						if runErr := a.runAgentStream(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], nil, candidate.hops, ""); runErr != nil {
-							if !transfer.Retryable(runErr) {
-								return runErr
-							}
-							failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.host.Name, direction, method, elevated, runErr))
-							continue
-						}
-						a.rememberRelay(sourceHost.ID, target.Name(), candidate.host.ID)
-						return nil
-					}
-					if runErr := a.runAgentMethod(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], nil, candidate.hops, method); runErr != nil {
+		err := a.runRelayCandidate(ctx, operation, preflight, sudoPasswords, candidate)
+		if err == nil {
+			a.rememberRelay(sourceHost.ID, target.Name(), candidate.host.ID)
+			return nil
+		}
+		if !transfer.Retryable(err) {
+			return err
+		}
+		failures = append(failures, err)
+	}
+	return errors.Join(errors.New("没有可从实际发起端访问的 SSH 跳板"), errors.Join(failures...))
+}
+
+func (a *App) runRelayCandidate(ctx context.Context, operation transfer.Operation, preflight transfer.PreflightReport, sudoPasswords map[strategy.Direction]string, candidate probedRelay) error {
+	var failures []error
+	for _, elevated := range []bool{false, true} {
+		for _, direction := range []strategy.Direction{strategy.SourcePush, strategy.TargetPull} {
+			if direction == strategy.SourcePush && !candidate.sourceOK || direction == strategy.TargetPull && !candidate.targetOK {
+				continue
+			}
+			for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream, strategy.NcatTar} {
+				if method == strategy.EncryptedStream || method == strategy.NcatTar {
+					if runErr := a.runAgentStreamWithCarrier(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], nil, candidate.hops, "", carrierForMethod(method)); runErr != nil {
 						if !transfer.Retryable(runErr) {
 							return runErr
 						}
 						failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.host.Name, direction, method, elevated, runErr))
 						continue
 					}
-					a.rememberRelay(sourceHost.ID, target.Name(), candidate.host.ID)
 					return nil
 				}
+				if runErr := a.runAgentMethod(ctx, operation, preflight, direction, elevated, sudoPasswords[direction], nil, candidate.hops, method); runErr != nil {
+					if !transfer.Retryable(runErr) {
+						return runErr
+					}
+					failures = append(failures, fmt.Errorf("%s/%s/%s/elevated=%t: %w", candidate.host.Name, direction, method, elevated, runErr))
+					continue
+				}
+				return nil
 			}
 		}
-		if candidate.cached {
-			a.forgetRelay(sourceHost.ID, target.Name())
-		}
-	}
-	if len(failures) == 0 {
-		return errors.New("没有可从实际发起端访问的 SSH 跳板")
 	}
 	return errors.Join(failures...)
 }
@@ -478,6 +516,10 @@ func (a *App) runHans(ctx context.Context, operation transfer.Operation, preflig
 }
 
 func (a *App) runHansRole(ctx context.Context, operation transfer.Operation, preflight transfer.PreflightReport, server, client *endpoint.Remote, serverArchitecture, clientArchitecture string, direction strategy.Direction, serverSudoPassword, clientSudoPassword string) error {
+	return a.runHansRoleMethods(ctx, operation, preflight, server, client, serverArchitecture, clientArchitecture, direction, serverSudoPassword, clientSudoPassword, []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream, strategy.NcatTar})
+}
+
+func (a *App) runHansRoleMethods(ctx context.Context, operation transfer.Operation, preflight transfer.PreflightReport, server, client *endpoint.Remote, serverArchitecture, clientArchitecture string, direction strategy.Direction, serverSudoPassword, clientSudoPassword string, methods []strategy.Method) error {
 	serverRoot, err := remoteIsRoot(ctx, server)
 	if err != nil {
 		return err
@@ -573,9 +615,9 @@ func (a *App) runHansRole(ctx context.Context, operation transfer.Operation, pre
 				continue
 			}
 		}
-		for _, method := range []strategy.Method{strategy.Rsync, strategy.SCP, strategy.EncryptedStream} {
-			if method == strategy.EncryptedStream {
-				err = a.runAgentStream(ctx, operation, preflight, direction, elevated, clientSudoPassword, &proxy, nil, serverTunnelIP)
+		for _, method := range methods {
+			if method == strategy.EncryptedStream || method == strategy.NcatTar {
+				err = a.runAgentStreamWithCarrier(ctx, operation, preflight, direction, elevated, clientSudoPassword, &proxy, nil, serverTunnelIP, carrierForMethod(method))
 			} else {
 				err = a.runHansMethod(ctx, operation, transferAgent, server, direction, elevated, serverTunnelIP, socksAddress, method)
 			}
@@ -915,6 +957,17 @@ func remoteRemotePair(operation transfer.Operation) (*endpoint.Remote, *endpoint
 }
 
 func (a *App) runAgentStream(ctx context.Context, operation transfer.Operation, preflight transfer.PreflightReport, direction strategy.Direction, elevated bool, sudoPassword string, socksProxy *connector.SOCKS5, prefix []connector.Hop, preferredListenerAddress string) error {
+	return a.runAgentStreamWithCarrier(ctx, operation, preflight, direction, elevated, sudoPassword, socksProxy, prefix, preferredListenerAddress, "")
+}
+
+func carrierForMethod(method strategy.Method) string {
+	if method == strategy.NcatTar {
+		return "ncat"
+	}
+	return ""
+}
+
+func (a *App) runAgentStreamWithCarrier(ctx context.Context, operation transfer.Operation, preflight transfer.PreflightReport, direction strategy.Direction, elevated bool, sudoPassword string, socksProxy *connector.SOCKS5, prefix []connector.Hop, preferredListenerAddress, carrier string) error {
 	source, target, ok := remoteRemotePair(operation)
 	if !ok {
 		return errors.New("加密直连流仅用于两个 Linux SSH 端点")
@@ -974,11 +1027,11 @@ func (a *App) runAgentStream(ctx context.Context, operation transfer.Operation, 
 	connectAction := "connect-send"
 	waiter := targetAgent
 	if direction == strategy.SourcePush {
-		listener, err = targetAgent.Listen("listen-receive", job, partial, token, false)
+		listener, err = targetAgent.ListenAt("listen-receive", job, partial, token, false, preferredListenerAddress)
 		listener.Addresses = prependAddress(listener.Addresses, target.ConnectionHost())
 		connector = sourceAgent
 	} else {
-		listener, err = sourceAgent.Listen("listen-send", job, operation.SourcePath, token, false)
+		listener, err = sourceAgent.ListenAt("listen-send", job, operation.SourcePath, token, false, preferredListenerAddress)
 		listener.Addresses = prependAddress(listener.Addresses, source.ConnectionHost())
 		connector, connectAction, waiter = targetAgent, "connect-receive", sourceAgent
 	}
@@ -990,7 +1043,7 @@ func (a *App) runAgentStream(ctx context.Context, operation transfer.Operation, 
 	var failures []error
 	connected := false
 	for _, address := range listener.Addresses {
-		if connectErr := connector.Connect(connectAction, map[bool]string{true: operation.SourcePath, false: partial}[direction == strategy.SourcePush], net.JoinHostPort(address, listener.Port), token, listener.Pin, socksProxy, routePayload, elevatedTarget && direction == strategy.TargetPull); connectErr != nil {
+		if connectErr := connector.ConnectWithCarrier(carrier, connectAction, map[bool]string{true: operation.SourcePath, false: partial}[direction == strategy.SourcePush], net.JoinHostPort(address, listener.Port), token, listener.Pin, socksProxy, routePayload, elevatedTarget && direction == strategy.TargetPull); connectErr != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", address, connectErr))
 			continue
 		}
@@ -1051,83 +1104,13 @@ func privateConnectionHosts(operation transfer.Operation) bool {
 }
 
 func runNcatTar(ctx context.Context, operation transfer.Operation, direction strategy.Direction) error {
-	source, target, ok := remoteRemotePair(operation)
-	if !ok {
-		return errors.New("tar+ncat 仅用于两个 SSH 端点")
-	}
-	before, err := transfer.Snapshot(ctx, operation.Source, operation.SourcePath, operation.Move)
+	preflight, err := transfer.Preflight(ctx, operation)
 	if err != nil {
 		return err
 	}
-	if _, err := operation.Destination.Stat(ctx, operation.TargetPath); err == nil || !errors.Is(err, fs.ErrNotExist) {
-		return errors.New("目标已存在，ncat 原子根路径跳过并改用控制机流式合并")
-	}
-	listenerEndpoint, connectorEndpoint := target, source
-	if direction == strategy.TargetPull {
-		listenerEndpoint, connectorEndpoint = source, target
-	}
-	addresses, err := remoteIPv4s(ctx, listenerEndpoint)
-	if err != nil {
-		return err
-	}
-	base := path.Base(operation.SourcePath)
-	partial := operation.TargetPath + ".dragfm-partial-" + randomTransferToken(8)
-	stage := partial + ".stage"
-	producer := "tar -czf - -C " + quoteRemote(path.Dir(operation.SourcePath)) + " -- " + quoteRemote(base)
-	consumer := ncatTarConsumer(stage, base, partial)
-	var failures []error
-	for _, port := range randomPorts(5) {
-		for _, address := range addresses {
-			listenScript, connectScript := "", ""
-			endpointArguments := quoteRemote(address) + " " + fmt.Sprintf("%d", port)
-			if direction == strategy.SourcePush {
-				listenScript = "ncat -l " + quoteRemote(address) + " " + fmt.Sprintf("%d", port) + " --recv-only | " + consumer
-				connectScript = producer + " | ncat --send-only " + endpointArguments
-			} else {
-				listenScript = producer + " | ncat -l " + quoteRemote(address) + " " + fmt.Sprintf("%d", port) + " --send-only"
-				connectScript = "ncat --recv-only " + endpointArguments + " | " + consumer
-			}
-			attemptCtx, cancel := context.WithCancel(ctx)
-			listenerDone := make(chan error, 1)
-			var listenerOutput bytes.Buffer
-			go func() {
-				listenerDone <- listenerEndpoint.Exec(attemptCtx, bashPipefail(listenScript), endpoint.ExecOptions{Stdout: &listenerOutput, Stderr: &listenerOutput})
-			}()
-			// The SSH exec request returning does not mean ncat has completed its
-			// bind yet. Give old/busy hosts a bounded startup window; failed ports
-			// still advance through the five random candidates.
-			timer := time.NewTimer(500 * time.Millisecond)
-			select {
-			case listenerErr := <-listenerDone:
-				cancel()
-				timer.Stop()
-				failures = append(failures, fmt.Errorf("%s:%d listener: %w: %s", address, port, listenerErr, strings.TrimSpace(listenerOutput.String())))
-				continue
-			case <-timer.C:
-			case <-ctx.Done():
-				cancel()
-				return ctx.Err()
-			}
-			var connectorOutput bytes.Buffer
-			connectErr := connectorEndpoint.Exec(attemptCtx, bashPipefail(connectScript), endpoint.ExecOptions{Stdout: &connectorOutput, Stderr: &connectorOutput})
-			if connectErr != nil {
-				cancel()
-			}
-			listenerErr := <-listenerDone
-			cancel()
-			if connectErr != nil || listenerErr != nil {
-				_ = operation.Destination.Remove(context.Background(), stage, true)
-				_ = operation.Destination.Remove(context.Background(), partial, before.Items[0].Mode.IsDir())
-				failures = append(failures, fmt.Errorf("%s:%d: %w: %s %s", address, port, errors.Join(connectErr, listenerErr), strings.TrimSpace(connectorOutput.String()), strings.TrimSpace(listenerOutput.String())))
-				continue
-			}
-			if err := operation.Destination.Rename(ctx, partial, operation.TargetPath, false); err != nil {
-				return err
-			}
-			return finishAcceleratedMove(ctx, operation, before, "tar+ncat")
-		}
-	}
-	return errors.Join(failures...)
+	// The ncat process is a carrier only. Authentication and safe tar extraction
+	// remain in the agent, including direct connections on untrusted networks.
+	return (&App{}).runAgentStreamWithCarrier(ctx, operation, preflight, direction, false, "", nil, nil, "", "ncat")
 }
 
 func remoteIPv4s(ctx context.Context, remote *endpoint.Remote) ([]string, error) {

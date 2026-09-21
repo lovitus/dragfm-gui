@@ -29,11 +29,12 @@ type Request struct {
 }
 
 type Response struct {
-	Version int               `json:"version"`
-	ID      string            `json:"id"`
-	OK      bool              `json:"ok"`
-	Error   string            `json:"error,omitempty"`
-	Values  map[string]string `json:"values,omitempty"`
+	Progress bool              `json:"progress,omitempty"`
+	Version  int               `json:"version"`
+	ID       string            `json:"id"`
+	OK       bool              `json:"ok"`
+	Error    string            `json:"error,omitempty"`
+	Values   map[string]string `json:"values,omitempty"`
 }
 
 type Conn struct {

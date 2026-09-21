@@ -28,6 +28,7 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
     let disposed = false
     let session = ''
     let shellPath: string | undefined
+    let cwdSequence = 0
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
@@ -66,6 +67,10 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
     })
     const removeCWD = onEvent('terminal:cwd', (event) => {
       if (event.session === session && event.pane === pane) {
+        if (event.sequence !== undefined) {
+          if (event.sequence <= cwdSequence) return
+          cwdSequence = event.sequence
+        }
         const unchanged = shellPath === event.path
         shellPath = event.path
         // A delayed duplicate prompt from the previous directory is not a

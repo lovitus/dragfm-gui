@@ -36,6 +36,9 @@ func receiveArchiveWithOwnership(reader io.Reader, target string, preserveOwner 
 		return err
 	}
 	defer compressed.Close()
+	// One framed archive per connection; a final receipt must not require
+	// closing the TLS stream merely to discover the gzip member boundary.
+	compressed.Multistream(false)
 	archive := tar.NewReader(compressed)
 	first, err := archive.Next()
 	if err != nil {

@@ -101,6 +101,9 @@ func Run(ctx context.Context, operation Operation) (Result, error) {
 			return Result{}, err
 		}
 		target := targetPath(copyOperation, item.Relative)
+		if err := verifyCopyParents(ctx, copyOperation, target); err != nil {
+			return Result{}, err
+		}
 		progress.Path = item.Relative
 		emit(operation, progress)
 		if err := copyItem(ctx, copyOperation, item, target, &progress); err != nil {
@@ -294,7 +297,7 @@ func snapshotItem(ctx context.Context, source endpoint.Endpoint, path, relative 
 
 func copyItem(ctx context.Context, operation Operation, item ManifestItem, target string, progress *Progress) error {
 	if item.Mode.IsDir() {
-		if err := operation.Destination.MkdirAll(ctx, target, item.Mode); err != nil {
+		if err := ensureCopyDirectory(ctx, operation.Destination, target); err != nil {
 			return err
 		}
 		return nil
@@ -343,12 +346,17 @@ func copyItem(ctx context.Context, operation Operation, item ManifestItem, targe
 		}
 	}()
 	buffer := make([]byte, 256*1024)
+	var copied int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		count, readErr := reader.Read(buffer)
 		if count > 0 {
+			copied += int64(count)
+			if copied > item.Size {
+				return ErrSourceChanged
+			}
 			written, writeErr := writer.Write(buffer[:count])
 			progress.BytesDone += int64(written)
 			emit(operation, *progress)
@@ -365,6 +373,9 @@ func copyItem(ctx context.Context, operation Operation, item ManifestItem, targe
 		if readErr != nil {
 			return readErr
 		}
+	}
+	if copied != item.Size {
+		return ErrSourceChanged
 	}
 	if err := writer.Commit(); err != nil {
 		return err

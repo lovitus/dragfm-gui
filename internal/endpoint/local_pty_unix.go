@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -39,10 +41,14 @@ func (l *Local) OpenPTY(ctx context.Context, directory, shell string, rows, colu
 		}
 		return nil, err
 	}
-	session := &localPTY{file: file, command: command, temporary: temporary}
+	session := &localPTY{file: file, command: command, temporary: temporary, done: make(chan struct{})}
+	go func() { session.waitErr = command.Wait(); close(session.done) }()
 	go func() {
-		<-ctx.Done()
-		_ = session.Close()
+		select {
+		case <-ctx.Done():
+			_ = session.Close()
+		case <-session.done:
+		}
 	}()
 	return session, nil
 }
@@ -124,6 +130,9 @@ type localPTY struct {
 	command   *exec.Cmd
 	temporary string
 	once      sync.Once
+	done      chan struct{}
+	waitErr   error
+	closeErr  error
 }
 
 func (p *localPTY) Input() io.WriteCloser { return p.file }
@@ -131,11 +140,24 @@ func (p *localPTY) Output() io.Reader     { return p.file }
 func (p *localPTY) Resize(rows, columns uint) error {
 	return pty.Setsize(p.file, &pty.Winsize{Rows: uint16(rows), Cols: uint16(columns)})
 }
-func (p *localPTY) Wait() error { return p.command.Wait() }
+func (p *localPTY) Wait() error { <-p.done; return p.waitErr }
 func (p *localPTY) Close() error {
 	var err error
 	p.once.Do(func() {
 		err = p.file.Close()
+		// pty.Start starts a new session/process group. Terminate that owned
+		// group, not unrelated shells, and reap the login-shell process.
+		_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGHUP)
+		select {
+		case <-p.done:
+		case <-time.After(200 * time.Millisecond):
+			_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGKILL)
+			select {
+			case <-p.done:
+			case <-time.After(2 * time.Second):
+				err = errors.Join(err, errors.New("PTY did not exit after SIGKILL"))
+			}
+		}
 		var cleanupErr error
 		if p.temporary != "" {
 			if info, statErr := os.Stat(p.temporary); statErr == nil && info.IsDir() {
@@ -144,7 +166,7 @@ func (p *localPTY) Close() error {
 				cleanupErr = os.Remove(p.temporary)
 			}
 		}
-		err = errors.Join(err, cleanupErr)
+		p.closeErr = errors.Join(err, cleanupErr)
 	})
-	return err
+	return p.closeErr
 }

@@ -161,7 +161,7 @@ func probeCapabilities(ctx context.Context, target endpoint.Endpoint, versionPat
 	command := "set -f; " +
 		"if stat -c '%d %i' -- " + quotePOSIX(versionPath) + " >/dev/null 2>&1; then printf 'VERSION '; stat -c '%d %i' -- " + quotePOSIX(versionPath) + "; " +
 		"elif stat -f '%d %i' -- " + quotePOSIX(versionPath) + " >/dev/null 2>&1; then printf 'VERSION '; stat -f '%d %i' -- " + quotePOSIX(versionPath) + "; fi; " +
-		"df -Pk -- " + quotePOSIX(spacePath) + " 2>/dev/null | awk 'END { printf \"FREE %.0f\\n\", $4 * 1024 }'; " +
+		"df -Pk -- " + quotePOSIX(spacePath) + " 2>/dev/null | awk 'NR > 1 && $4 ~ /^[0-9]+$/ { printf \"FREE %.0f\\n\", $4 * 1024 }'; " +
 		"printf 'ARCH '; uname -m 2>/dev/null || true; " +
 		"for t in rsync scp tar ncat nc sudo; do if command -v \"$t\" >/dev/null 2>&1; then printf 'TOOL %s\\n' \"$t\"; fi; done"
 	var output bytes.Buffer
@@ -182,7 +182,9 @@ func probeCapabilities(ctx context.Context, target endpoint.Endpoint, versionPat
 				}
 			case "FREE":
 				if len(fields) == 2 {
-					result.FreeBytes, _ = strconv.ParseInt(fields[1], 10, 64)
+					if value, parseErr := strconv.ParseInt(fields[1], 10, 64); parseErr == nil && value >= 0 {
+						result.FreeBytes = value
+					}
 				}
 			case "ARCH":
 				if len(fields) == 2 {
@@ -204,7 +206,7 @@ func probeCapabilities(ctx context.Context, target endpoint.Endpoint, versionPat
 		fallbackCommand := "printf 'ARCH '; uname -m 2>/dev/null; " +
 			"if stat -c '%d %i' -- " + quotePOSIX(versionPath) + " >/dev/null 2>&1; then printf 'VERSION '; stat -c '%d %i' -- " + quotePOSIX(versionPath) + "; " +
 			"elif stat -f '%d %i' -- " + quotePOSIX(versionPath) + " >/dev/null 2>&1; then printf 'VERSION '; stat -f '%d %i' -- " + quotePOSIX(versionPath) + "; fi; " +
-			"df -Pk -- " + quotePOSIX(spacePath) + " 2>/dev/null | awk 'END { printf \"FREE %.0f\\n\", $4 * 1024 }'; " +
+			"df -Pk -- " + quotePOSIX(spacePath) + " 2>/dev/null | awk 'NR > 1 && $4 ~ /^[0-9]+$/ { printf \"FREE %.0f\\n\", $4 * 1024 }'; " +
 			"for t in rsync scp tar ncat nc sudo; do command -v \"$t\" >/dev/null 2>&1 && printf 'TOOL %s\\n' \"$t\"; done"
 		var lastFallbackErr error
 		for attempt := 0; attempt < 3; attempt++ {
@@ -238,7 +240,9 @@ func probeCapabilities(ctx context.Context, target endpoint.Endpoint, versionPat
 		if provider, ok := target.(interface {
 			AvailableBytes(context.Context, string) (int64, error)
 		}); ok {
-			result.FreeBytes, _ = provider.AvailableBytes(ctx, spacePath)
+			if value, probeErr := provider.AvailableBytes(ctx, spacePath); probeErr == nil {
+				result.FreeBytes = value
+			}
 		}
 	}
 	if len(result.Tools) == 0 {

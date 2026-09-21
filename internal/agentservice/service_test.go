@@ -99,7 +99,7 @@ func TestPinnedTLSDirectStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	receiver := New()
-	listen := receiver.Handle(agentproto.Request{Version: agentproto.ProtocolVersion, ID: "listen", Action: "listen-receive", Options: map[string]string{"job": "one", "path": target}, Secret: map[string]string{"token": "one-use-secret"}})
+	listen := receiver.Handle(agentproto.Request{Version: agentproto.ProtocolVersion, ID: "listen", Action: "listen-receive", Options: map[string]string{"job": "one", "path": target, "bind": "127.0.0.1"}, Secret: map[string]string{"token": "one-use-secret"}})
 	if !listen.OK {
 		t.Fatal(listen.Error)
 	}
@@ -130,7 +130,7 @@ func TestPinnedTLSDirectStreamViaAuthenticatedSOCKS(t *testing.T) {
 		t.Fatal(err)
 	}
 	receiver := New()
-	listen := receiver.Handle(agentproto.Request{Version: agentproto.ProtocolVersion, ID: "listen", Action: "listen-receive", Options: map[string]string{"job": "socks", "path": target}, Secret: map[string]string{"token": "socks-token"}})
+	listen := receiver.Handle(agentproto.Request{Version: agentproto.ProtocolVersion, ID: "listen", Action: "listen-receive", Options: map[string]string{"job": "socks", "path": target, "bind": "127.0.0.1"}, Secret: map[string]string{"token": "socks-token"}})
 	if !listen.OK {
 		t.Fatal(listen.Error)
 	}

@@ -3,6 +3,7 @@ package remoteagent
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"sync"
 	"time"
 
@@ -37,11 +38,30 @@ func (s *Session) abortTransport() {
 	if s.ssh == nil {
 		return
 	}
-	// Signal the actual helper so its CommandContext children also terminate.
-	if channel, ok := s.ssh.(interface{ Signal(ssh.Signal) error }); ok {
-		_ = channel.Signal(ssh.SIGTERM)
-	}
-	_ = s.ssh.Close()
+	s.abortOnce.Do(func() {
+		closed := make(chan struct{})
+		go func() {
+			if channel, ok := s.ssh.(interface{ Signal(ssh.Signal) error }); ok {
+				signalled := make(chan struct{})
+				go func() { _ = channel.Signal(ssh.SIGTERM); close(signalled) }()
+				select {
+				case <-signalled:
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			_ = s.ssh.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(300 * time.Millisecond):
+			// A peer that does not consume channel writes can block channel Close too.
+			// Closing the owning transport unblocks those writes; browsing reconnects.
+			if s.remote != nil {
+				_ = s.remote.Close()
+			}
+		}
+	})
 }
 
 func (s *Session) Close() error {
@@ -68,6 +88,9 @@ func (s *Session) Close() error {
 		if s.remote != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			removeErr = s.remote.Remove(ctx, s.Directory, true)
+			if errors.Is(removeErr, fs.ErrNotExist) {
+				removeErr = nil
+			}
 			cancel()
 		}
 		s.closeErr = errors.Join(cleanupErr, stdinErr, removeErr)

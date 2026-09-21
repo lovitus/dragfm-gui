@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flyssh/flyssh/pkg/connector"
@@ -20,6 +21,9 @@ import (
 )
 
 type Remote struct {
+	closed         atomic.Bool
+	closeOnce      sync.Once
+	closeErr       error
 	name           string
 	fingerprint    string
 	chain          *connector.Chain
@@ -185,6 +189,16 @@ func (r *Remote) Stat(ctx context.Context, target string) (Entry, error) {
 	if r.sftp == nil {
 		entries, err := r.findEntries(ctx, target, true)
 		if err != nil {
+			var status bytes.Buffer
+			probe := "if [ -e " + shellQuote(target) + " ] || [ -L " + shellQuote(target) + " ]; then printf exists; elif [ -x " + shellQuote(path.Dir(target)) + " ]; then printf missing; else printf denied; fi"
+			if probeErr := r.Exec(ctx, probe, ExecOptions{Stdout: &status}); probeErr == nil {
+				switch status.String() {
+				case "missing":
+					return Entry{}, fs.ErrNotExist
+				case "denied":
+					return Entry{}, fs.ErrPermission
+				}
+			}
 			return Entry{}, err
 		}
 		if len(entries) != 1 {
@@ -255,7 +269,7 @@ func (r *Remote) CreateAtomic(_ context.Context, target string, mode fs.FileMode
 		_ = session.Close()
 		return nil, err
 	}
-	command := fmt.Sprintf("umask 077; exec cat > %s", shellQuote(temporary))
+	command := fmt.Sprintf("umask 077; set -C; exec cat > %s", shellQuote(temporary))
 	if err := session.Start(command); err != nil {
 		_ = session.Close()
 		return nil, err
@@ -264,6 +278,14 @@ func (r *Remote) CreateAtomic(_ context.Context, target string, mode fs.FileMode
 }
 
 func (r *Remote) MkdirAll(ctx context.Context, target string, mode fs.FileMode) error {
+	if entry, err := r.Stat(ctx, target); err == nil {
+		if !entry.IsDir() {
+			return fmt.Errorf("directory %q is not a real directory", target)
+		}
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	if r.sftp != nil {
 		if err := r.sftp.MkdirAll(target); err != nil {
 			return err
@@ -326,7 +348,11 @@ func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bo
 	if !overwrite {
 		flag = "-n"
 	}
-	return r.Exec(ctx, "mv "+flag+" -- "+shellQuote(source)+" "+shellQuote(target), ExecOptions{})
+	command := "mv " + flag + " -T -- " + shellQuote(source) + " " + shellQuote(target)
+	if !overwrite {
+		command += "; result=$?; [ \"$result\" -eq 0 ] || exit \"$result\"; if [ -e " + shellQuote(source) + " ] || [ -L " + shellQuote(source) + " ]; then exit 73; fi"
+	}
+	return r.Exec(ctx, command, ExecOptions{})
 }
 
 func (r *Remote) CopyNative(ctx context.Context, source, target string, sourceDirectory, merge bool) error {
@@ -525,12 +551,21 @@ func (r *Remote) detectLoginShell(ctx context.Context) string {
 	}
 }
 
+func (r *Remote) IsClosed() bool { return r.closed.Load() }
 func (r *Remote) Close() error {
-	var err error
-	if r.sftp != nil {
-		err = r.sftp.Close()
-	}
-	return errors.Join(err, r.chain.Close())
+	r.closeOnce.Do(func() {
+		r.closed.Store(true)
+		// Close transport first, unblocking pending SFTP requests/channel writes.
+		var transportErr, sftpErr error
+		if r.chain != nil {
+			transportErr = r.chain.Close()
+		}
+		if r.sftp != nil {
+			sftpErr = r.sftp.Close()
+		}
+		r.closeErr = errors.Join(transportErr, sftpErr)
+	})
+	return r.closeErr
 }
 
 func (r *Remote) listPOSIX(ctx context.Context, directory string) ([]Entry, error) {
@@ -692,7 +727,7 @@ func (w *sshAtomicWriter) Commit() error {
 		_ = w.Abort()
 		return err
 	}
-	command := fmt.Sprintf("chmod %04o -- %s && mv -f -- %s %s", w.mode.Perm(), shellQuote(w.temporary), shellQuote(w.temporary), shellQuote(w.target))
+	command := fmt.Sprintf("chmod %04o -- %s && sync -f -- %s && mv -f -T -- %s %s", w.mode.Perm(), shellQuote(w.temporary), shellQuote(w.temporary), shellQuote(w.temporary), shellQuote(w.target))
 	if err := w.remote.Exec(context.Background(), command, ExecOptions{}); err != nil {
 		_ = w.Abort()
 		return err

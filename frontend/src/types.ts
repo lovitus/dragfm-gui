@@ -97,6 +97,7 @@ export interface TerminalData {
 }
 
 export interface TerminalCWD {
+  sequence?: number
   session: string
   pane: PaneID
   path: string

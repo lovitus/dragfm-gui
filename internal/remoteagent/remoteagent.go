@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/flyssh/flyssh/pkg/connector"
+	"github.com/lovitus/dragfm-gui/internal/activity"
 	"github.com/lovitus/dragfm-gui/internal/agentproto"
 	"github.com/lovitus/dragfm-gui/internal/assets"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
@@ -34,6 +35,7 @@ type Session struct {
 	done      chan struct{}
 	stdin     io.WriteCloser
 	once      sync.Once
+	abortOnce sync.Once
 	closeErr  error
 	callMu    sync.Mutex
 	elevated  bool
@@ -78,31 +80,51 @@ func (s *Session) call(ctx context.Context, action string, options, secret map[s
 		return nil, err
 	}
 	id := randomHex(12)
-	request := agentproto.Request{Version: agentproto.ProtocolVersion, ID: id, Action: action, Options: options, Secret: secret}
+	requestOptions := make(map[string]string, len(options)+1)
+	for key, value := range options {
+		requestOptions[key] = value
+	}
+	requestOptions["progress"] = "true"
+	request := agentproto.Request{Version: agentproto.ProtocolVersion, ID: id, Action: action, Options: requestOptions, Secret: secret}
 	if err := s.Protocol.Send(request); err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		return nil, err
 	}
-	var response agentproto.Response
-	if err := s.Protocol.Receive(&response); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	for {
+		var response agentproto.Response
+		if err := s.Protocol.Receive(&response); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
 		}
-		return nil, err
+		if response.ID != id || response.Version != agentproto.ProtocolVersion {
+			return nil, errors.New("invalid remote helper response")
+		}
+		if response.Progress {
+			count, err := strconv.ParseInt(response.Values["wire_bytes"], 10, 64)
+			if err != nil || count < 0 {
+				return nil, errors.New("invalid helper activity counter")
+			}
+			if s.ctx != nil {
+				activity.Report(s.ctx, response.Values["action"], count)
+			}
+			continue
+		}
+		if !response.OK {
+			return nil, errors.New(response.Error)
+		}
+		return response.Values, nil
 	}
-	if response.ID != id || response.Version != agentproto.ProtocolVersion {
-		return nil, errors.New("invalid remote helper response")
-	}
-	if !response.OK {
-		return nil, errors.New(response.Error)
-	}
-	return response.Values, nil
 }
 
 func (s *Session) Listen(action, job, path, token string, preserveOwner bool) (Listener, error) {
-	values, err := s.Call(action, map[string]string{"job": job, "path": path, "preserve_owner": strconv.FormatBool(preserveOwner)}, map[string]string{"token": token})
+	return s.ListenAt(action, job, path, token, preserveOwner, "")
+}
+func (s *Session) ListenAt(action, job, path, token string, preserveOwner bool, bind string) (Listener, error) {
+	values, err := s.Call(action, map[string]string{"job": job, "path": path, "preserve_owner": strconv.FormatBool(preserveOwner), "bind": bind, "ack": "true"}, map[string]string{"token": token})
 	if err != nil {
 		return Listener{}, err
 	}
@@ -120,6 +142,10 @@ func (s *Session) Listen(action, job, path, token string, preserveOwner bool) (L
 }
 
 func (s *Session) Connect(action, path, address, token, pin string, proxy *connector.SOCKS5, route string, preserveOwner bool) error {
+	return s.ConnectWithCarrier("", action, path, address, token, pin, proxy, route, preserveOwner)
+}
+
+func (s *Session) ConnectWithCarrier(carrier, action, path, address, token, pin string, proxy *connector.SOCKS5, route string, preserveOwner bool) error {
 	secret := map[string]string{"token": token, "pin": pin}
 	if proxy != nil {
 		secret["socks_address"], secret["socks_username"], secret["socks_password"] = proxy.Address, proxy.Username, proxy.Password
@@ -127,7 +153,7 @@ func (s *Session) Connect(action, path, address, token, pin string, proxy *conne
 	if route != "" {
 		secret["route"] = route
 	}
-	_, err := s.Call(action, map[string]string{"path": path, "address": address, "preserve_owner": strconv.FormatBool(preserveOwner)}, secret)
+	_, err := s.Call(action, map[string]string{"path": path, "address": address, "preserve_owner": strconv.FormatBool(preserveOwner), "carrier": carrier, "ack": "true"}, secret)
 	return err
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lovitus/dragfm-gui/internal/activity"
 	"github.com/lovitus/dragfm-gui/internal/config"
 	"github.com/lovitus/dragfm-gui/internal/configtext"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
@@ -110,8 +111,8 @@ func (a *App) PrepareDrop(sourcePane PaneID, sourcePath string, destinationPane 
 	}
 	target := destination.endpoint.Join(destinationDirectory, entry.Name)
 	_, statErr := destination.endpoint.Stat(context.Background(), target)
-	conflict := statErr == nil
-	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+	conflict := statErr == nil || errors.Is(statErr, fs.ErrPermission)
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) && !errors.Is(statErr, fs.ErrPermission) {
 		return DropPreview{}, statErr
 	}
 	return DropPreview{SourcePane: sourcePane, DestinationPane: destinationPane, SourcePath: sourcePath, DestinationDirectory: destinationDirectory, TargetPath: target, Name: entry.Name, Conflict: conflict}, nil
@@ -145,6 +146,9 @@ func (a *App) QueueTransfer(request TransferRequest) (string, error) {
 	return a.submitFor(source.generation, jobs.Job{Description: description, Run: func(ctx context.Context, emit func(jobs.Update)) error {
 		var knownBytes int64
 		var knownFiles int
+		ctx, _ = activity.WithObserver(ctx, func(stage string, wireBytes int64) {
+			emit(jobs.Update{Indeterminate: true, Stage: "remote-activity", Message: fmt.Sprintf("远端活性 · %s · 已测量 %d 通道 I/O bytes（可能含协议开销，非文件完成百分比）", stage, wireBytes)})
+		})
 		operation := transfer.Operation{Source: source.endpoint, Destination: destination.endpoint, SourcePath: request.SourcePath, TargetPath: request.TargetPath, Move: request.Move, Overwrite: request.Overwrite, Progress: func(progress transfer.Progress) {
 			bytesTotal, filesTotal := progress.BytesTotal, progress.FilesTotal
 			if bytesTotal == 0 {

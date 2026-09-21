@@ -114,9 +114,10 @@ type terminalDataModel struct {
 }
 
 type terminalCWDModel struct {
-	Session string `json:"session"`
-	Pane    PaneID `json:"pane"`
-	Path    string `json:"path"`
+	Sequence uint64 `json:"sequence"`
+	Session  string `json:"session"`
+	Pane     PaneID `json:"pane"`
+	Path     string `json:"path"`
 }
 
 func timestamp(value time.Time) string {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lovitus/dragfm-gui/internal/activity"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -216,6 +217,7 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 }
 
 func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arguments []string) error {
+	connection = activity.Conn(ctx, connection)
 	defer connection.Close()
 	commandArgs, err := rsyncServerArguments(arguments)
 	if err != nil {
@@ -250,7 +252,7 @@ func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arg
 		inputDone <- copyErr
 	}()
 	_, outputErr := io.Copy(connection, stdout)
-	if tcp, ok := connection.(*net.TCPConn); ok {
+	if tcp, ok := connection.(interface{ CloseWrite() error }); ok {
 		_ = tcp.CloseWrite()
 	}
 	waitErr := session.Wait()
