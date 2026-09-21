@@ -3,6 +3,7 @@ package main
 import (
 	"io/fs"
 	"os"
+"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"path/filepath"
 
 	"github.com/lovitus/dragfm-gui/frontend"
@@ -15,6 +16,7 @@ import (
 )
 
 func main() {
+if handled,code:=endpoint.FilesystemChildMain(os.Args[1:],os.Stdin,os.Stdout,os.Stderr); handled { os.Exit(code) }
 	if handled, code := rsyncbridge.ChildMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
 		os.Exit(code)
 	}

@@ -120,3 +120,34 @@ func TestRealNcatCarriesPinnedTLSAndStops(t *testing.T) {
 		t.Fatalf("payload %q: %v", data, err)
 	}
 }
+
+func TestCleanupRemovesOwnedReadOnlyTreeWithoutFollowingLinks(t *testing.T) {
+	root := t.TempDir()
+	partial := filepath.Join(root, "x.dragfm-partial-0123456789abcdef")
+	outside := filepath.Join(root, "outside")
+	if err := os.WriteFile(outside, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	service := New()
+	if err := service.trackPartial(partial); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(partial, "readonly"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(partial, "readonly", "file"), []byte("partial"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(partial, "link")); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(filepath.Join(partial, "readonly"), 0000)
+	os.Chmod(partial, 0500)
+	service.Close()
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Fatalf("readonly partial survived: %v", err)
+	}
+	if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
+		t.Fatal("cleanup followed symlink")
+	}
+}

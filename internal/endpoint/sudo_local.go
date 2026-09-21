@@ -1,10 +1,12 @@
 package endpoint
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/lovitus/dragfm-gui/internal/boundedbuf"
 	"io"
 	"io/fs"
 	"os"
@@ -12,12 +14,13 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// SudoLocal delegates reads to the ordinary local endpoint and performs only
-// filesystem mutations through sudo. Credentials are supplied over stdin and
+// SudoLocal uses the ordinary endpoint where possible and narrowly scoped
+// filesystem subprocesses for explicitly approved protected paths. Credentials are supplied over stdin and
 // never appear in argv, the environment, or a temporary file.
 type SudoLocal struct {
 	local    *Local
@@ -48,13 +51,25 @@ func (s *SudoLocal) Abs(ctx context.Context, value string) (string, error) {
 func (s *SudoLocal) Join(parts ...string) string { return s.local.Join(parts...) }
 func (s *SudoLocal) Dir(value string) string     { return s.local.Dir(value) }
 func (s *SudoLocal) List(ctx context.Context, directory string) ([]Entry, error) {
-	return s.local.List(ctx, directory)
+	entries, err := s.local.List(ctx, directory)
+	if errors.Is(err, fs.ErrPermission) {
+		err = s.childResult(ctx, "list", directory, &entries)
+	}
+	return entries, err
 }
 func (s *SudoLocal) Stat(ctx context.Context, path string) (Entry, error) {
-	return s.local.Stat(ctx, path)
+	entry, err := s.local.Stat(ctx, path)
+	if errors.Is(err, fs.ErrPermission) {
+		err = s.childResult(ctx, "stat", path, &entry)
+	}
+	return entry, err
 }
 func (s *SudoLocal) Readlink(ctx context.Context, path string) (string, error) {
-	return s.local.Readlink(ctx, path)
+	target, err := s.local.Readlink(ctx, path)
+	if errors.Is(err, fs.ErrPermission) {
+		err = s.childResult(ctx, "readlink", path, &target)
+	}
+	return target, err
 }
 
 func (s *SudoLocal) Open(ctx context.Context, path string) (io.ReadCloser, error) {
@@ -62,7 +77,7 @@ func (s *SudoLocal) Open(ctx context.Context, path string) (io.ReadCloser, error
 	if err == nil || !errors.Is(err, fs.ErrPermission) {
 		return reader, err
 	}
-	command, stdin, stderr, err := s.command(ctx, "cat", path)
+	command, stdin, stderr, marker, err := s.childCommand(ctx, "read", path)
 	if err != nil {
 		return nil, err
 	}
@@ -74,12 +89,11 @@ func (s *SudoLocal) Open(ctx context.Context, path string) (io.ReadCloser, error
 	if err := command.Start(); err != nil {
 		return nil, err
 	}
-	if s.password != "" {
-		if _, err := io.WriteString(stdin, s.password+"\n"); err != nil {
-			_ = stdin.Close()
-			_ = command.Wait()
-			return nil, err
-		}
+	if err := s.writePrelude(stdin, marker); err != nil {
+		stdin.Close()
+		command.Process.Kill()
+		command.Wait()
+		return nil, err
 	}
 	_ = stdin.Close()
 	return &sudoReadCloser{ReadCloser: stdout, command: command, stderr: stderr}, nil
@@ -90,49 +104,32 @@ func (s *SudoLocal) CreateAtomic(ctx context.Context, target string, mode fs.Fil
 		return nil, err
 	}
 	partial := filepath.Join(filepath.Dir(target), ".dragfm-partial-"+randomSuffix())
-	// Keep the credential stream separate from file content. If sudo already has
-	// a cached ticket it may not consume stdin; sharing stdin with tee would then
-	// prepend the password to the destination file.
-	sudoArgs := []string{"-n", "--", "sh", "-c", `cat <&3 > "$1"`, "dragfm-sudo-writer", partial}
-	if s.password != "" {
-		sudoArgs = []string{"-S", "-p", "", "--", "sh", "-c", `cat <&3 > "$1"`, "dragfm-sudo-writer", partial}
-	}
-	command := exec.CommandContext(ctx, "sudo", sudoArgs...)
-	credentialInput, err := command.StdinPipe()
+	command, stdin, stderr, marker, err := s.childCommand(ctx, "write", partial)
 	if err != nil {
 		return nil, err
 	}
-	dataReader, dataWriter, err := os.Pipe()
-	if err != nil {
-		_ = credentialInput.Close()
-		return nil, err
-	}
-	command.ExtraFiles = []*os.File{dataReader}
 	command.Stdout = io.Discard
-	stderr := &bytes.Buffer{}
-	command.Stderr = stderr
 	if err := command.Start(); err != nil {
-		_ = credentialInput.Close()
-		_ = dataReader.Close()
-		_ = dataWriter.Close()
+		stdin.Close()
 		return nil, err
 	}
-	_ = dataReader.Close()
-	if s.password != "" {
-		if _, err := io.WriteString(credentialInput, s.password+"\n"); err != nil {
-			_ = credentialInput.Close()
-			_ = dataWriter.Close()
-			_ = command.Wait()
-			return nil, err
-		}
+	if err := s.writePrelude(stdin, marker); err != nil {
+		stdin.Close()
+		command.Process.Kill()
+		command.Wait()
+		return nil, err
 	}
-	_ = credentialInput.Close()
-	return &sudoAtomicWriter{endpoint: s, ctx: ctx, command: command, stdin: dataWriter, stderr: stderr, partial: partial, target: target, mode: mode.Perm()}, nil
+	return &sudoAtomicWriter{endpoint: s, ctx: ctx, command: command, stdin: stdin, stderr: stderr, partial: partial, target: target, mode: mode.Perm()}, nil
 }
 
 func (s *SudoLocal) MkdirAll(ctx context.Context, target string, mode fs.FileMode) error {
-	if info, err := os.Stat(target); err == nil && info.IsDir() {
+	if info, err := s.Stat(ctx, target); err == nil {
+		if !info.IsDir() {
+			return errors.New("destination is not a real directory")
+		}
 		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
 	if err := s.run(ctx, "mkdir", "-p", "-m", fmt.Sprintf("%04o", mode.Perm()), target); err != nil {
 		return err
@@ -158,7 +155,7 @@ func (s *SudoLocal) Chtimes(ctx context.Context, path string, atime, mtime time.
 	if err := s.local.Chtimes(ctx, path, atime, mtime); err == nil {
 		return nil
 	}
-	return s.run(ctx, "touch", "-t", mtime.Format("200601021504.05"), path)
+	return s.childResult(ctx, "times", path, nil, strconv.FormatInt(atime.UnixNano(), 10), strconv.FormatInt(mtime.UnixNano(), 10))
 }
 
 func (s *SudoLocal) Remove(ctx context.Context, path string, recursive bool) error {
@@ -181,17 +178,10 @@ func (s *SudoLocal) Rename(ctx context.Context, source, target string, overwrite
 	if err := rejectFilesystemRoot(target); err != nil {
 		return err
 	}
-	if err := s.local.Rename(ctx, source, target, overwrite); err == nil {
-		return nil
+	if err := s.local.Rename(ctx, source, target, overwrite); err == nil || !errors.Is(err, fs.ErrPermission) {
+		return err
 	}
-	if !overwrite {
-		if _, err := os.Lstat(target); err == nil {
-			return fs.ErrExist
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-	}
-	return s.run(ctx, "mv", "-f", source, target)
+	return s.childResult(ctx, "rename", source, nil, target, strconv.FormatBool(overwrite))
 }
 
 func (s *SudoLocal) Exec(ctx context.Context, command string, options ExecOptions) error {
@@ -233,18 +223,19 @@ func (s *SudoLocal) run(ctx context.Context, program string, args ...string) err
 	return nil
 }
 
-func (s *SudoLocal) command(ctx context.Context, program string, args ...string) (*exec.Cmd, io.WriteCloser, *bytes.Buffer, error) {
+func (s *SudoLocal) command(ctx context.Context, program string, args ...string) (*exec.Cmd, io.WriteCloser, *boundedbuf.Buffer, error) {
 	sudoArgs := []string{"-n", "--", program}
 	if s.password != "" {
 		sudoArgs = []string{"-S", "-p", "", "--", program}
 	}
 	sudoArgs = append(sudoArgs, args...)
 	command := exec.CommandContext(ctx, "sudo", sudoArgs...)
+	command.WaitDelay = 2 * time.Second
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	stderr := &bytes.Buffer{}
+	stderr := &boundedbuf.Buffer{}
 	command.Stderr = stderr
 	return command, stdin, stderr, nil
 }
@@ -252,7 +243,7 @@ func (s *SudoLocal) command(ctx context.Context, program string, args ...string)
 type sudoReadCloser struct {
 	io.ReadCloser
 	command *exec.Cmd
-	stderr  *bytes.Buffer
+	stderr  *boundedbuf.Buffer
 }
 
 func (r *sudoReadCloser) Close() error {
@@ -269,7 +260,7 @@ type sudoAtomicWriter struct {
 	ctx      context.Context
 	command  *exec.Cmd
 	stdin    io.WriteCloser
-	stderr   *bytes.Buffer
+	stderr   *boundedbuf.Buffer
 	partial  string
 	target   string
 	mode     fs.FileMode
@@ -298,7 +289,7 @@ func (w *sudoAtomicWriter) Commit() error {
 	closeErr := w.stdin.Close()
 	waitErr := w.command.Wait()
 	if closeErr != nil || waitErr != nil {
-		_ = w.endpoint.run(context.Background(), "rm", "-f", w.partial)
+		_ = w.cleanup()
 		message := strings.TrimSpace(w.stderr.String())
 		if message != "" {
 			waitErr = fmt.Errorf("sudo tee 失败: %s", message)
@@ -306,15 +297,15 @@ func (w *sudoAtomicWriter) Commit() error {
 		return errors.Join(closeErr, waitErr)
 	}
 	if err := w.endpoint.run(w.ctx, "chmod", fmt.Sprintf("%04o", w.mode.Perm()), w.partial); err != nil {
-		_ = w.endpoint.run(context.Background(), "rm", "-f", w.partial)
+		_ = w.cleanup()
 		return err
 	}
 	if err := w.endpoint.takeOwnership(w.ctx, w.partial); err != nil {
-		_ = w.endpoint.run(context.Background(), "rm", "-f", w.partial)
+		_ = w.cleanup()
 		return err
 	}
-	if err := w.endpoint.run(w.ctx, "mv", "-f", w.partial, w.target); err != nil {
-		_ = w.endpoint.run(context.Background(), "rm", "-f", w.partial)
+	if err := w.endpoint.Rename(w.ctx, w.partial, w.target, true); err != nil {
+		_ = w.cleanup()
 		return err
 	}
 	return nil
@@ -327,7 +318,7 @@ func (w *sudoAtomicWriter) Abort() error {
 	w.done = true
 	closeErr := w.stdin.Close()
 	waitErr := w.command.Wait()
-	removeErr := w.endpoint.run(context.Background(), "rm", "-f", w.partial)
+	removeErr := w.cleanup()
 	return errors.Join(closeErr, waitErr, removeErr)
 }
 
@@ -340,6 +331,96 @@ func rejectFilesystemRoot(path string) error {
 	}
 	if clean == root {
 		return errors.New("拒绝以管理员权限修改文件系统根目录")
+	}
+	return nil
+}
+
+func (w *sudoAtomicWriter) cleanup() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return w.endpoint.Remove(ctx, w.partial, false)
+}
+func (s *SudoLocal) childCommand(ctx context.Context, op, path string, args ...string) (*exec.Cmd, io.WriteCloser, *boundedbuf.Buffer, string, error) {
+	if !filepath.IsAbs(path) {
+		return nil, nil, nil, "", errors.New("filesystem path must be absolute")
+	}
+	if strings.ContainsAny(s.password, "\r\n") || len(s.password) > 4096 {
+		return nil, nil, nil, "", errors.New("invalid sudo password framing")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, nil, nil, "", err
+	}
+	marker := fmt.Sprintf("%x", nonce[:]) // A frame delimiter, not a credential.
+	argv := append([]string{FilesystemChildFlag, op, marker, path}, args...)
+	command, stdin, stderr, err := s.command(ctx, executable, argv...)
+	return command, stdin, stderr, marker, err
+}
+func (s *SudoLocal) writePrelude(writer io.Writer, marker string) error {
+	if s.password != "" {
+		if _, err := io.WriteString(writer, s.password+"\n"); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(writer, "dragfm-fs-v1:"+marker+"\n")
+	return err
+}
+func (s *SudoLocal) childResult(ctx context.Context, op, path string, result any, args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	command, stdin, stderr, marker, err := s.childCommand(ctx, op, path, args...)
+	if err != nil {
+		return err
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return err
+	}
+	if err = command.Start(); err != nil {
+		stdin.Close()
+		return err
+	}
+	if err = s.writePrelude(stdin, marker); err != nil {
+		stdin.Close()
+		command.Process.Kill()
+		command.Wait()
+		return err
+	}
+	stdin.Close()
+	// Directory listings are bounded independently of adversarial diagnostic output.
+	data, readErr := io.ReadAll(io.LimitReader(stdout, (16<<20)+1))
+	if len(data) > 16<<20 {
+		command.Process.Kill()
+		readErr = errors.New("filesystem response exceeds 16 MiB")
+	}
+	waitErr := command.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if waitErr != nil {
+		var exit *exec.ExitError
+		if errors.As(waitErr, &exit) {
+			switch exit.ExitCode() {
+			case 73:
+				return fs.ErrExist
+			case 66:
+				return fs.ErrNotExist
+			case 77:
+				return fs.ErrPermission
+			}
+		}
+		return fmt.Errorf("sudo filesystem %s: %w: %s", op, waitErr, stderr.String())
+	}
+	if readErr != nil {
+		return readErr
+	}
+	if result != nil {
+		return json.Unmarshal(data, result)
 	}
 	return nil
 }

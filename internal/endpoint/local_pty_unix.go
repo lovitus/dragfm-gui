@@ -147,7 +147,11 @@ func (p *localPTY) Close() error {
 		err = p.file.Close()
 		// pty.Start starts a new session/process group. Terminate that owned
 		// group, not unrelated shells, and reap the login-shell process.
-		_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGHUP)
+		select {
+		case <-p.done: // A reaped PID must never be signalled again.
+		default:
+			_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGHUP)
+		}
 		select {
 		case <-p.done:
 		case <-time.After(200 * time.Millisecond):

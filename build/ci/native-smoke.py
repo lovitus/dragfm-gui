@@ -155,6 +155,10 @@ Subsystem sftp internal-sftp
         proxy = ThrottledSSH(server_port)
         source, target = fixture / 'source', fixture / 'target'
         source.mkdir(); target.mkdir(); (target / 'archive').mkdir()
+        protected = fixture / 'protected-local'
+        protected.mkdir(mode=0o755)
+        command('sudo', '-n', 'chown', 'root:wheel', str(protected))
+        command('sudo', '-n', 'chmod', '0755', str(protected))
         with (source / 'first.bin').open('wb') as output:
             for _ in range(64):
                 output.write(os.urandom(1024 * 1024))
@@ -182,7 +186,7 @@ Subsystem sftp internal-sftp
                 command('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(host_key))
                 server = start_server()
             plan = dict(phase=phase, password=password, markdown=markdown, fingerprint=fingerprint,
-                        source=str(source), target=str(target), parent=str(fixture), home=home,
+                        source=str(source), target=str(target), parent=str(fixture), home=home, protected=str(protected),
                         hash=digest(source / 'hash.txt'), firstBytes=64*1024*1024, historyIDs=history)
             (fixture / 'smoke.js').write_text('window.__dragfmSmokePlan = ' + json.dumps(plan, ensure_ascii=True) + ';\n' + script)
             report_path = fixture / 'report.json'
@@ -223,9 +227,12 @@ Subsystem sftp internal-sftp
                 assert (target / 'archive' / 'tree' / 'keep.txt').read_text() == 'existing target retained', 'Directory merge discarded unrelated destination'
                 assert os.readlink(target / 'archive' / 'tree' / 'link') == 'nested/leaf.txt', 'Directory merge changed symlink semantics'
                 assert copied.stat().st_mode & 0o777 == 0o640 and int(copied.stat().st_mtime) == 1700000000, 'Directory copy lost mode/mtime'
+                assert digest(protected / 'second.txt') == expected['second.txt'], 'Protected local download hash mismatch'
+                assert (protected / 'second.txt').stat().st_uid == os.getuid(), 'Protected download not owned by launching user'
+                assert not list(protected.glob('.dragfm-partial-*')), 'Protected download left staging files'
                 vault = (fixture / 'vault.json').read_bytes()
                 assert password.encode() not in vault and user_key.read_bytes() not in vault, 'Vault stored credentials in plaintext'
-        (evidence / 'FILESYSTEM_VERIFIED.json').write_text(json.dumps(dict(success=True, checks=['SHA-256 of both destination files', 'copy source retained', 'move source removed only after verification', 'confirmed deletion', 'directory merge preserves existing files/symlink/mode/mtime', 'vault ciphertext excludes plaintext credentials']), indent=2) + '\n')
+        (evidence / 'FILESYSTEM_VERIFIED.json').write_text(json.dumps(dict(success=True, checks=['SHA-256 of both destination files', 'copy source retained', 'move source removed only after verification', 'confirmed deletion', 'directory merge preserves existing files/symlink/mode/mtime', 'vault ciphertext excludes plaintext credentials', 'real sudo protected local download SHA-256 and ownership', 'declined sudo move retains source']), indent=2) + '\n')
     finally:
         if app is not None and app.poll() is None:
             app.terminate()
@@ -237,6 +244,10 @@ Subsystem sftp internal-sftp
             except (OSError, ValueError, subprocess.SubprocessError):
                 subprocess.run(['sudo', '-n', 'kill', '-TERM', str(server.pid)], check=False, timeout=10)
         server_log.close()
+        # Only the fixed disposable protected directory can contain root-owned remnants.
+        protected = fixture / 'protected-local'
+        if protected.exists():
+            subprocess.run(['sudo', '-n', 'rm', '-rf', str(protected)], check=False, timeout=10)
         shutil.rmtree(fixture)
 
 

@@ -60,7 +60,49 @@ func (s *Service) cleanupPartials() {
 	s.mu.Unlock()
 	for _, path := range owned {
 		// Root confines cleanup even when a different process renames the parent.
-		_ = path.parent.RemoveAll(path.name)
+		_ = removeOwnedPartial(path.parent, path.name)
 		_ = path.parent.Close()
 	}
+}
+
+// Restore only owner access on directories inside the owned staging tree. The
+// archive may have restored 0500/0000 modes before a subsequent step failed.
+// OpenRoot confines traversal; symlinks are removed as links, never followed.
+func removeOwnedPartial(parent *os.Root, name string) error {
+	info, err := parent.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return parent.Remove(name)
+	}
+	if err := parent.Chmod(name, 0700); err != nil {
+		return err
+	}
+	child, err := parent.OpenRoot(name)
+	if err != nil {
+		return err
+	}
+	directory, err := child.Open(".")
+	if err != nil {
+		child.Close()
+		return err
+	}
+	entries, err := directory.ReadDir(-1)
+	directory.Close()
+	if err == nil {
+		for _, entry := range entries {
+			if err = removeOwnedPartial(child, entry.Name()); err != nil {
+				break
+			}
+		}
+	}
+	child.Close()
+	if err != nil {
+		return err
+	}
+	return parent.Remove(name)
 }

@@ -10,6 +10,7 @@
   const terminalOutput = {};
   const events = [];
   let challengeFailure = '';
+  let declineLocalSudo = false;
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const wait = async (description, predicate, timeout = 20000) => {
@@ -46,19 +47,19 @@
     await wait(`${which} navigation`, () => pathInput(which).value === path && !pane(which).querySelector('.loading-line'));
     await wait(`${which} file-to-shell cwd`, () => cwd[which]?.path === path);
   };
-  const drag = async (name, choice, directory = 'archive') => {
-    const source = await wait(`source row ${name}`, () => row('left', name));
-    const target = await wait(`directory row ${directory}`, () => row('right', directory));
+  const drag = async (name, choice, directory = 'archive', sourcePane = 'left', targetPane = 'right', expectedDirectory = plan.target + '/archive') => {
+    const source = await wait(`source row ${name}`, () => row(sourcePane, name));
+    const target = await wait(`directory row ${directory}`, () => directory === null ? pane(targetPane).querySelector('.file-viewport') : row(targetPane, directory));
     const from = source.getBoundingClientRect(), to = target.getBoundingClientRect();
     const start = { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerId: 1, pointerType: 'mouse', clientX: from.x + from.width / 2, clientY: from.y + from.height / 2 };
     source.dispatchEvent(new PointerEvent('pointerdown', start));
     window.dispatchEvent(new PointerEvent('pointermove', { ...start, clientX: to.x + to.width / 2, clientY: to.y + to.height / 2 }));
     await pause(80);
-    assert(target.classList.contains('drop-target'), 'directory hover target was not highlighted');
+    assert(directory === null ? pane(targetPane).classList.contains('drop-current') : target.classList.contains('drop-target'), 'directory hover target was not highlighted');
     window.dispatchEvent(new PointerEvent('pointerup', { ...start, buttons: 0, clientX: to.x + to.width / 2, clientY: to.y + to.height / 2 }));
     const action = await wait(`transfer choice ${choice}`, () => [...document.querySelectorAll('.choice-button')].find((item) => item.querySelector('strong').textContent === choice));
     assert(document.getSelection().toString() === '', 'drag selected page text');
-    assert(document.querySelector('.transfer-path').textContent.includes(`${plan.target}/archive`), 'drop did not resolve to the hovered directory');
+    assert(document.querySelector('.transfer-path').textContent.includes(expectedDirectory), 'drop did not resolve to the hovered directory');
     const before = new Set((await window.go.webgui.App.JobSnapshot()).map((job) => job.id));
     action.click();
     await wait('transfer dialog closes', () => !document.querySelector('.drop-confirm'));
@@ -88,6 +89,10 @@
     window.runtime.EventsOn('job:update', (event) => { events.push(event); if (events.length > 2000) events.shift(); });
     window.runtime.EventsOn('challenge', (event) => {
       void (async () => {
+        if (event.kind === 'password' && event.title === '目标目录需要管理员权限' && event.message.includes(plan.protected)) {
+          await click(declineLocalSudo ? '取消' : '继续');
+          return;
+        }
         if (event.kind !== 'confirm-host-key' || !event.message.includes(plan.fingerprint) || plan.phase === 'changed-key') {
           challengeFailure = 'unexpected SSH authentication challenge';
           await api.ResolveChallenge(event.id, false, '', false);
@@ -214,6 +219,16 @@
       await wait('shell-to-file cwd', () => pathInput('right').value === `${plan.target}/archive`);
       assert(!terminalOutput.right.includes('\x1b]777;dragfm-cwd='), 'internal cwd markers leaked to xterm');
       checks.push('native xterm paste/Enter, login environment and shell-to-file cwd');
+      await navigate('left', plan.protected);
+      const protectedCopy = await drag('second.txt', '复制', null, 'right', 'left', plan.protected);
+      await complete(protectedCopy.id);
+      checks.push('native remote-to-protected-local download through real scoped sudo');
+      declineLocalSudo = true;
+      const refusedMove = await drag('second.txt', '移动并覆盖', null, 'right', 'left', plan.protected);
+      await complete(refusedMove.id, 'failed');
+      assert(row('right', 'second.txt'), 'declined sudo move removed source');
+      checks.push('declined local sudo prevents move and retains remote source');
+      await navigate('left', plan.source);
       window.runtime.WindowSetSize(1080, 680);
       await wait('small native window', () => window.innerWidth <= 1100);
       const tasks = document.querySelector('.task-pane').getBoundingClientRect();

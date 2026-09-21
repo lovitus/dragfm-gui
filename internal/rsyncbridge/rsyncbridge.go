@@ -2,7 +2,6 @@ package rsyncbridge
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/lovitus/dragfm-gui/internal/activity"
+	"github.com/lovitus/dragfm-gui/internal/boundedbuf"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -129,7 +129,8 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 	}
 	command := exec.CommandContext(ctx, rsync, args...)
 	configureChildLifecycle(command)
-	var localError bytes.Buffer
+	command.WaitDelay = 2 * time.Second
+	var localError boundedbuf.Buffer
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = &localError
@@ -236,7 +237,7 @@ func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arg
 	if err != nil {
 		return err
 	}
-	var stderr bytes.Buffer
+	var stderr boundedbuf.Buffer
 	session.Stderr = &stderr
 	if err := session.Start(joinShellWords(commandArgs)); err != nil {
 		return err
