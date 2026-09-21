@@ -24,7 +24,9 @@ jobs:
           patch = lzma.decompress(packed)
           assert len(patch) == 111922
           assert hashlib.sha256(patch).hexdigest() == '7fb23d2b9e173cc0ec9d9709dce56550855c6a1081b1f39cde7399ce9a9a74be'
-          subprocess.run(['git', 'apply', '--index', '-'], input=patch, check=True)
+          # Workflow configuration is updated separately through the authorized
+          # connector; the hosted token intentionally has source-only access.
+          subprocess.run(['git', 'apply', '--index', '--exclude=.github/workflows/build.yml', '-'], input=patch, check=True)
           subprocess.run(['git', 'rm', '-r', '.ci-review'], check=True)
           subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
       - name: Commit reviewed sources without rewriting concurrent work
