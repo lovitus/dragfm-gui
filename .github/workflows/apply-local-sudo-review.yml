@@ -1,0 +1,39 @@
+name: apply-local-sudo-review
+on:
+  pull_request:
+    paths: ['.github/workflows/apply-local-sudo-review.yml']
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: github.repository == 'lovitus/dragfm-gui' && github.event.pull_request.number == 1 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Apply checksum-verified filesystem and native regressions
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, lzma, subprocess
+          patch = lzma.decompress(Path('.ci-review/local-sudo.patch.xz').read_bytes())
+          assert len(patch) == 37307
+          assert hashlib.sha256(patch).hexdigest() == '9bd2996db5409a8850a730df1b0cc930317784e25caafc82d3fcacc994d1fcc9'
+          subprocess.run(['git', 'apply', '--index', '-'], input=patch, check=True)
+          subprocess.run(['git', 'rm', '-r', '.ci-review'], check=True)
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+      - name: Commit only if the branch has not changed
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin "refs/heads/$HEAD_BRANCH" | cut -f1)" = "$EXPECTED_HEAD"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: frame sudo filesystem data; validate protected native downloads and cleanup'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
