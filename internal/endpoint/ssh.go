@@ -403,9 +403,7 @@ func (r *Remote) Exec(ctx context.Context, command string, options ExecOptions) 
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		_ = session.Close()
-		<-done
-		return ctx.Err()
+		return r.cancelCommand(ctx, session, done)
 	}
 }
 

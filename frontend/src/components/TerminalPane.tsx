@@ -11,7 +11,7 @@ function decodeBase64(value: string): Uint8Array {
   return bytes
 }
 
-export default function TerminalPane({ pane, path, active, onCWD }: { pane: PaneID; path: string; active: boolean; onCWD: (path: string) => void }) {
+export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure }: { pane: PaneID; path: string; active: boolean; onCWD: (path: string) => void; onSyncFailure?: () => void }) {
   const host = useRef<HTMLDivElement>(null)
   const sessionRef = useRef('')
   const reportErrorRef = useRef<(reason: unknown) => void>(() => {})
@@ -20,6 +20,8 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
   displayedPath.current = path
   const onCWDRef = useRef(onCWD)
   onCWDRef.current = onCWD
+  const onSyncFailureRef = useRef(onSyncFailure)
+  onSyncFailureRef.current = onSyncFailure
   const activeRef = useRef(active)
   activeRef.current = active
 
@@ -117,7 +119,13 @@ export default function TerminalPane({ pane, path, active, onCWD }: { pane: Pane
   useEffect(() => {
     if (path === initialPath.current) return
     initialPath.current = path
-    if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => reportErrorRef.current(reason))
+    if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => {
+      // A refused cd (editing/running program) is not an acknowledgement.
+      // Release the navigation gate so the next genuine shell prompt can
+      // reconcile the pane; never silently queue keystrokes into that program.
+      onSyncFailureRef.current?.()
+      reportErrorRef.current(reason)
+    })
   }, [path])
 
   return <div className="terminal-host" ref={host} data-testid={`terminal-${pane}`} />

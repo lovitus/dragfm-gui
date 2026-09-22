@@ -25,9 +25,9 @@ if [ ! -d "$project_root/frontend/node_modules" ]; then
 fi
 npm --prefix "$project_root/frontend" run build
 
-env GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 CC=clang \
+env GOOS=darwin GOARCH="${DRAGFM_MAC_ARCH:-arm64}" CGO_ENABLED=1 CC=clang \
   go build -mod=vendor -trimpath -buildvcs=false -tags production \
   -ldflags="-s -w -linkmode=external -extldflags=-Wl,-sectcreate,__TEXT,__info_plist,$project_root/build/macos/Info.plist,-framework,UniformTypeIdentifiers" \
-  -o "$output_dir/dragfm-gui-wails-darwin-arm64" ./cmd/dragfm-wails
+  -o "$output_dir/dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}" ./cmd/dragfm-wails
 
-(cd "$output_dir" && shasum -a 256 dragfm-gui-wails-darwin-arm64 > SHA256SUMS.wails)
+(cd "$output_dir" && shasum -a 256 "dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}" > SHA256SUMS.wails)

@@ -125,7 +125,7 @@ func (a *App) TerminalChangeDirectory(sessionID, directory string) error {
 	if !session.busy.CompareAndSwap(false, true) {
 		return errors.New("终端正在编辑输入或执行命令；未向程序注入 cd，请先返回 Shell 提示符")
 	}
-	_, err = io.WriteString(session.pty.Input(), terminalCDCommand(abs))
+	_, err = io.WriteString(session.pty.Input(), terminalCDForEndpoint(session.endpoint, abs))
 	return err
 }
 

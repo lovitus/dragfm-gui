@@ -74,7 +74,7 @@ export DRAGFM_E2E_HANS=1
 export DRAGFM_E2E_SUDO=1
 set +e
 go test -mod=vendor -tags=integration -race -count=1 -timeout=20m -json ./internal/webgui \
-  -run 'Test(RemoteTransferMethodsOnHostedFixtures|HostedSSHQueueAndHistory|HostedNonRootSudoTransfers|HostedReviewedTransportMatrix|HostedReviewedHansRolesAndMethods)' \
+  -run 'Test(RemoteTransferMethodsOnHostedFixtures|HostedSSHQueueAndHistory|HostedNonRootSudoTransfers|HostedReviewedTransportMatrix|HostedReviewedHansRolesAndMethods|HostedSSHCommandCancellationLatency)' \
   2>&1 | tee test-results/ssh-integration.jsonl
 ssh_status=${PIPESTATUS[0]}
 set -e

@@ -20,6 +20,7 @@ export interface FilePaneProps {
   onNavigate: (path: string, fromTerminal?: boolean) => void
   onEndpoint: (endpoint: string) => void
   onRefresh: () => void
+  onSyncFailure?: () => void
   onSelect: (entry?: FileEntry) => void
   onBeginDrag: (event: PointerEvent, pane: PaneID, entry: FileEntry) => void
   onDelete: () => void
@@ -113,7 +114,7 @@ export default function FilePane(props: FilePaneProps) {
       <div className="terminal-label"><div><Icon name="terminal" />交互终端 <span>{model.listing.endpoint === '本机' ? '本地 PTY' : 'SSH PTY'}</span></div><span className="terminal-shortcut">Backspace 上一级 · d 删除 · h 哈希</span></div>
       <div className="terminal-region">
         {terminalEndpoint === model.listing.endpoint
-          ? <TerminalPane key={`${pane}:${model.listing.endpoint}`} pane={pane} path={model.listing.path} active={props.active} onCWD={(next) => props.onNavigate(next, true)} />
+          ? <TerminalPane key={`${pane}:${model.listing.endpoint}`} pane={pane} path={model.listing.path} active={props.active} onCWD={(next) => props.onNavigate(next, true)} onSyncFailure={props.onSyncFailure} />
           : <div className="empty-state">等待端点连接后启动终端…</div>}
       </div>
     </section>

@@ -1,4 +1,7 @@
 import '@testing-library/jest-dom/vitest'
+// jsdom does not implement layout; native acceptance covers real geometry.
+Object.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [] })
+Object.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect() })
 
 Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
   configurable: true,

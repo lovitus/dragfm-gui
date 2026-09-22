@@ -137,7 +137,12 @@ func (l *Local) Exec(ctx context.Context, command string, options ExecOptions) e
 	}
 	cmd := exec.CommandContext(ctx, shell, args...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = options.Directory, options.Stdin, options.Stdout, options.Stderr
-	return cmd.Run()
+	configureCommandCancellation(cmd)
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func (l *Local) Close() error { return nil }

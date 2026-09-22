@@ -33,10 +33,10 @@ func TestHeaderRejectsExcessiveUnauthenticatedKDFParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*Header){
-		"time": func(h *Header) { h.Time = ^uint32(0) },
-		"memory": func(h *Header) { h.Memory = ^uint32(0) },
+		"time":    func(h *Header) { h.Time = ^uint32(0) },
+		"memory":  func(h *Header) { h.Memory = ^uint32(0) },
 		"threads": func(h *Header) { h.Threads = 255 },
-		"nonce": func(h *Header) { h.Nonce = nil },
+		"nonce":   func(h *Header) { h.Nonce = nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			header := base

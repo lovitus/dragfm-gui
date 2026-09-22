@@ -267,6 +267,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
           }}
           onEndpoint={(endpoint) => void changeEndpoint(pane, endpoint)}
           onRefresh={() => void load(pane)}
+          onSyncFailure={() => cwdGates.current[pane].clear()}
           onSelect={(entry) => select(pane, entry)}
           onBeginDrag={beginDrag}
           onDelete={() => models[pane].selected && setDeleteEntry({ pane, entry: models[pane].selected! })}

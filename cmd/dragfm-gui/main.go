@@ -1,8 +1,8 @@
 package main
 
 import (
+	"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"os"
-"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"path/filepath"
 
 	"fyne.io/fyne/v2/app"
@@ -12,7 +12,9 @@ import (
 )
 
 func main() {
-if handled,code:=endpoint.FilesystemChildMain(os.Args[1:],os.Stdin,os.Stdout,os.Stderr); handled { os.Exit(code) }
+	if handled, code := endpoint.FilesystemChildMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
 	if !assets.Available() {
 		panic("embedded Linux helper payloads are missing")
 	}

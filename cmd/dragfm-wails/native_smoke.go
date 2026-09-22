@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,7 @@ func readNativeSmoke(args []string) (*nativeSmoke, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || (goruntime.GOOS != "windows" && info.Mode().Perm()&0077 != 0) {
 		return nil, errors.New("native smoke directory must be a private real directory")
 	}
 	marker, err := os.ReadFile(filepath.Join(directory, "SMOKE_ONLY"))
