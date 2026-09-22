@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +70,13 @@ func (s *nativeSmoke) domReady(ctx context.Context) {
 	finish := func(report map[string]any) {
 		s.once.Do(func() {
 			close(done)
+			if report["success"] != true {
+				// Only explicit isolated smoke runs collect stacks, before shutdown
+				// erases the blocked state. There is no profiling HTTP endpoint.
+				var trace bytes.Buffer
+				_ = pprof.Lookup("goroutine").WriteTo(&trace, 2)
+				report["goroutines"] = trace.String()
+			}
 			data, err := json.MarshalIndent(report, "", "  ")
 			if err == nil {
 				temporary := filepath.Join(s.directory, "report.json.tmp")
@@ -82,8 +91,6 @@ func (s *nativeSmoke) domReady(ctx context.Context) {
 			if err != nil {
 				_, _ = fmt.Fprintln(os.Stderr, "native smoke report:", err)
 			}
-			// Allow the hosted runner to capture the actual native window, then
-			// exit normally through OnShutdown so vault persistence is exercised.
 			go func() { time.Sleep(3 * time.Second); runtime.Quit(ctx) }()
 		})
 	}
