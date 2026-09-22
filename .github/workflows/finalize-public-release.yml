@@ -21,6 +21,10 @@ jobs:
       - name: Apply bounded probes, native signing and fixture diagnostics
         run: |
           python3 build/ci/finalize-public-release.py
+          # GITHUB_TOKEN can commit source but cannot update other workflows.
+          # The reviewed platform-workflow change is committed through the
+          # authorized GitHub connector, not by widening this runner's token.
+          git restore .github/workflows/platforms.yml
           git ls-files -z '*.go' ':!:vendor/*' ':!:third_party/*' | xargs -0 gofmt -w
           git diff --check
           go test -mod=vendor -count=1 -timeout=5m ./internal/endpoint ./internal/transfer ./internal/webgui
