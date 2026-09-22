@@ -1,0 +1,39 @@
+name: apply-reviewed-io-and-platform-safety
+on:
+  pull_request:
+    paths: ['.github/workflows/complete-safety-review.yml']
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: github.event.pull_request.number == 1 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Apply exact reviewed changes and check formatting
+        run: |
+          python3 build/ci/complete-safety-review.py
+          git ls-files -z '*.go' ':!:vendor/*' ':!:third_party/*' | xargs -0 gofmt -w
+          git diff --check
+          python3 -m py_compile build/ci/portable-smoke.py
+      - name: Validate the reviewed backend safety regressions
+        run: go test -mod=vendor -count=1 -timeout=5m ./internal/endpoint ./internal/transfer ./internal/webgui
+      - name: Commit verified edits and remove completed helper
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/complete-safety-review.yml build/ci/complete-safety-review.py
+          git add -u
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(security): cancel stalled I/O, reject aliased self-copy and preserve Windows file identity'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"
