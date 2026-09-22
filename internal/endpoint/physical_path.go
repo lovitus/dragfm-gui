@@ -55,7 +55,10 @@ func (r *Remote) PhysicalPath(ctx context.Context, value string) (string, error)
 			err = r.Exec(ctx, "cd -P -- "+shellQuote(directory)+" && pwd -P", ExecOptions{Stdout: &output})
 			resolved = strings.TrimSuffix(output.String(), "\n")
 		}
-		if err == nil && resolved != "" {
+		if err == nil && !path.IsAbs(resolved) {
+			return "", errors.New("physical path resolver returned no absolute directory")
+		}
+		if err == nil {
 			for i := len(tail) - 1; i >= 0; i-- {
 				resolved = path.Join(resolved, tail[i])
 			}

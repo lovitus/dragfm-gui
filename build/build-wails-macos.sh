@@ -30,4 +30,6 @@ env GOOS=darwin GOARCH="${DRAGFM_MAC_ARCH:-arm64}" CGO_ENABLED=1 CC=clang \
   -ldflags="-s -w -linkmode=external -extldflags=-Wl,-sectcreate,__TEXT,__info_plist,$project_root/build/macos/Info.plist,-framework,UniformTypeIdentifiers" \
   -o "$output_dir/dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}" ./cmd/dragfm-wails
 
+codesign --force --sign - "$output_dir/dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}"
+
 (cd "$output_dir" && shasum -a 256 "dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}" > SHA256SUMS.wails)

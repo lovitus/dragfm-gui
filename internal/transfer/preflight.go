@@ -146,6 +146,8 @@ func existingDirectory(ctx context.Context, target endpoint.Endpoint, directory 
 }
 
 func probeCapabilities(ctx context.Context, target endpoint.Endpoint, versionPath, spacePath string) (EndpointCapabilities, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	result := EndpointCapabilities{Tools: make(map[string]bool), FreeBytes: -1}
 	if runtime.GOOS == "windows" {
 		identity, _ := target.Identity(ctx)

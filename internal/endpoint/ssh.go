@@ -75,6 +75,8 @@ func (r *Remote) AvailableBytes(ctx context.Context, target string) (int64, erro
 }
 
 func (r *Remote) FileVersion(ctx context.Context, target string) (uint64, uint64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	statCommand := "if stat -c '%d %i' -- " + shellQuote(target) + " >/dev/null 2>&1; then stat -c '%d %i' -- " + shellQuote(target) + "; else stat -f '%d %i' -- " + shellQuote(target) + "; fi"
 	parse := func(value string) (uint64, uint64, error) {
 		fields := strings.Fields(value)
@@ -129,7 +131,7 @@ func (r *Remote) FileVersion(ctx context.Context, target string) (uint64, uint64
 	return 0, 0, errors.Join(errors.New("remote stat returned no file identity"), lastErr)
 }
 
-func (r *Remote) Identity(ctx context.Context) (Identity, error) {
+func (r *Remote) identityViaCommand(ctx context.Context) (Identity, error) {
 	var stdout bytes.Buffer
 	err := r.Exec(ctx, "if test -r /etc/machine-id; then cat /etc/machine-id; elif test -r /var/lib/dbus/machine-id; then cat /var/lib/dbus/machine-id; fi", ExecOptions{Stdout: &stdout})
 	return Identity{Kind: SSHKind, Name: r.name, MachineID: strings.TrimSpace(stdout.String()), Fingerprint: r.fingerprint}, err

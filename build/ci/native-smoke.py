@@ -125,6 +125,7 @@ AllowUsers {user}
 AllowTcpForwarding yes
 X11Forwarding no
 PrintMotd no
+LogLevel DEBUG2
 Subsystem sftp internal-sftp
 ''')
 
@@ -213,6 +214,8 @@ Subsystem sftp internal-sftp
             shutil.copyfile(report_path, evidence / f'{phase}.json')
             print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
             if app.returncode != 0 or not report.get('success'):
+                with (evidence / f'{phase}-fixture-processes.log').open('wb') as processes:
+                    subprocess.run(['ps', '-axo', 'pid,ppid,pgid,state,etime,command'], stdout=processes, stderr=subprocess.STDOUT, timeout=5, check=False)
                 raise RuntimeError(f'{phase}: native acceptance failed')
             if phase == 'exercise':
                 history = report['historyIDs']

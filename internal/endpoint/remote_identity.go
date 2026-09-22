@@ -20,7 +20,9 @@ func (r *Remote) Identity(ctx context.Context) (Identity, error) {
 	result := Identity{Kind: SSHKind, Name: r.name, Fingerprint: r.fingerprint}
 	if r.sftp == nil {
 		identity, err := r.identityViaCommand(ctx)
-		if !validMachineID(identity.MachineID) { identity.MachineID = "" }
+		if !validMachineID(identity.MachineID) {
+			identity.MachineID = ""
+		}
 		return identity, err
 	}
 	id, err := readMachineID(ctx, r.Open)
@@ -36,13 +38,21 @@ func validMachineID(value string) bool {
 func readMachineID(ctx context.Context, open func(context.Context, string) (io.ReadCloser, error)) (string, error) {
 	for _, candidate := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
 		reader, err := open(ctx, candidate)
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) { continue }
-		if err != nil { return "", err }
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
 		data, readErr := io.ReadAll(io.LimitReader(reader, 257))
 		closeErr := reader.Close()
-		if err := errors.Join(readErr, closeErr); err != nil { return "", err }
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return "", err
+		}
 		value := strings.TrimSpace(string(data))
-		if len(data) <= 256 && validMachineID(value) { return strings.ToLower(value), nil }
+		if len(data) <= 256 && validMachineID(value) {
+			return strings.ToLower(value), nil
+		}
 	}
 	return "", ctx.Err()
 }
