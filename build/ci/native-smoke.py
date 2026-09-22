@@ -19,6 +19,8 @@ import tempfile
 import threading
 import time
 
+from byte_rate import ByteRatePacer
+
 
 class ThrottledSSH:
     def __init__(self, destination: int) -> None:
@@ -40,10 +42,6 @@ class ThrottledSSH:
                 downstream, _ = self.listener.accept()
                 upstream = socket.create_connection(('127.0.0.1', self.destination), timeout=10)
                 upstream.settimeout(None)
-                # Only the explicit byte-rate limiter should delay this fixture.
-                # Nagle plus delayed ACKs can otherwise add per-request latency
-                # to SSH/SFTP's bidirectional protocol and dwarf the intended
-                # rate, making the unchanged 64 MiB acceptance nondeterministic.
                 downstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
@@ -55,6 +53,7 @@ class ThrottledSSH:
 
     def relay(self, source: socket.socket, target: socket.socket, direction: str) -> None:
         state = dict(direction=direction, bytes=0, started=time.monotonic(), last_io=None, closed=False)
+        pacer = ByteRatePacer(4 * 1024 * 1024)
         with self.lock:
             self.transfers.append(state)
         try:
@@ -66,9 +65,12 @@ class ThrottledSSH:
                 with self.lock:
                     state['bytes'] += len(data)
                     state['last_io'] = time.monotonic()
-                # Slow the genuine encrypted SSH data stream, not the app or
-                # its queue: make Running+Pending overlap deterministic.
-                self.stopped.wait(len(data) / (4 * 1024 * 1024))
+                # Keep genuine encrypted SSH traffic capped at 4 MiB/s. Use
+                # elapsed time, not one relative sleep per network fragment:
+                # scheduler coalescing must not multiply protocol latency.
+                delay = pacer.delay(len(data))
+                if delay:
+                    self.stopped.wait(delay)
         except OSError:
             pass
         finally:
@@ -111,6 +113,7 @@ def main() -> None:
         raise RuntimeError('This acceptance entrypoint currently targets macOS arm64')
     binary = Path(sys.argv[1]).resolve(strict=True)
     project = Path(__file__).resolve().parents[2]
+    command(sys.executable, str(project / 'build/ci/test_byte_rate.py'))
     evidence = project / 'test-results' / 'native-macos-arm64'
     evidence.mkdir(parents=True, exist_ok=True)
     (evidence / 'BINARY_SHA256.txt').write_text(digest(binary) + '  ' + binary.name + '\n')
@@ -222,9 +225,6 @@ Subsystem sftp internal-sftp
                 while app.poll() is None and time.monotonic() < deadline:
                     if report_path.exists() and not captured:
                         captured = True
-                        # Numeric transport diagnostics contain no payloads,
-                        # keys or tokens and distinguish slow traffic from EOF
-                        # deadlocks without weakening any acceptance deadline.
                         (evidence / f'{phase}-wire.json').write_text(json.dumps(proxy.snapshot(), indent=2) + '\n')
                         # Failure may leave the private-key editor visible.
                         # Only capture completed acceptance screens, never keys.
@@ -274,7 +274,6 @@ Subsystem sftp internal-sftp
             except (OSError, ValueError, subprocess.SubprocessError):
                 subprocess.run(['sudo', '-n', 'kill', '-TERM', str(server.pid)], check=False, timeout=10)
         server_log.close()
-        # Only the fixed disposable protected directory can contain root-owned remnants.
         protected = fixture / 'protected-local'
         if protected.exists():
             subprocess.run(['sudo', '-n', 'rm', '-rf', str(protected)], check=False, timeout=10)
