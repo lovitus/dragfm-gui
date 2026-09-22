@@ -102,14 +102,20 @@ func Execute(ctx context.Context, attempts []Attempt, approve Approval, emit fun
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, context.Canceled) {
 			return err
 		}
 		var retry interface{ Retryable() bool }
 		if errors.As(err, &retry) && !retry.Retryable() {
 			return err
 		}
+		// A route-local dial/handshake deadline is a failed route, not a
+		// cancellation of the user's job. When the parent is still live, let
+		// the next direction or proxy recover after the attempt has cleaned up.
 		failures = append(failures, fmt.Errorf("%s/%s/%s: %w", attempt.Tier, attempt.Direction, attempt.Method, err))
+	}
+	if len(failures) == 0 {
+		return errors.New("没有可用的传输路径")
 	}
 	return fmt.Errorf("所有传输路径均失败: %w", errors.Join(failures...))
 }
