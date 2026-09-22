@@ -524,6 +524,10 @@ func validateOperationPaths(ctx context.Context, operation Operation) error {
 	if sourceErr != nil || targetErr != nil || sourceID.MachineID == "" || sourceID.MachineID != targetID.MachineID {
 		return nil
 	}
+	sourcePath, targetPath, err = physicalOperationPaths(ctx, operation, sourcePath, targetPath)
+	if err != nil {
+		return err
+	}
 	if sourcePath == targetPath {
 		return errors.New("source and destination are the same path")
 	}

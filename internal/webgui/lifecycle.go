@@ -64,6 +64,7 @@ func (a *App) redactKnownLocked(value string) string {
 			secrets[secret] = true
 		}
 	}
+	add(string(a.password))
 	for _, key := range a.document.Keys {
 		add(key.PEM)
 		add(key.Passphrase)

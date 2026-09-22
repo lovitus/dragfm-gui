@@ -54,7 +54,12 @@ func (r *Remote) Name() string           { return r.name }
 
 // AvailableBytes uses the SFTP statvfs extension so capability probing does
 // not depend on a login shell preserving stdout from df/awk pipelines.
-func (r *Remote) AvailableBytes(_ context.Context, target string) (int64, error) {
+func (r *Remote) AvailableBytes(ctx context.Context, target string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp == nil {
 		return -1, errors.New("SFTP statvfs is unavailable")
 	}
@@ -131,6 +136,11 @@ func (r *Remote) Identity(ctx context.Context) (Identity, error) {
 }
 
 func (r *Remote) Home(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp != nil {
 		return r.sftp.Getwd()
 	}
@@ -166,6 +176,11 @@ func (r *Remote) Join(parts ...string) string { return path.Join(parts...) }
 func (r *Remote) Dir(value string) string     { return path.Dir(value) }
 
 func (r *Remote) List(ctx context.Context, directory string) ([]Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp == nil {
 		return r.listPOSIX(ctx, directory)
 	}
@@ -186,6 +201,11 @@ func (r *Remote) List(ctx context.Context, directory string) ([]Entry, error) {
 }
 
 func (r *Remote) Stat(ctx context.Context, target string) (Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return Entry{}, err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp == nil {
 		entries, err := r.findEntries(ctx, target, true)
 		if err != nil {
@@ -218,6 +238,11 @@ func (r *Remote) Stat(ctx context.Context, target string) (Entry, error) {
 }
 
 func (r *Remote) Readlink(ctx context.Context, target string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp != nil {
 		return r.sftp.ReadLink(target)
 	}
@@ -226,7 +251,7 @@ func (r *Remote) Readlink(ctx context.Context, target string) (string, error) {
 	return strings.TrimSuffix(stdout.String(), "\n"), err
 }
 
-func (r *Remote) Open(_ context.Context, target string) (io.ReadCloser, error) {
+func (r *Remote) open(_ context.Context, target string) (io.ReadCloser, error) {
 	if r.sftp != nil {
 		return r.sftp.Open(target)
 	}
@@ -246,7 +271,7 @@ func (r *Remote) Open(_ context.Context, target string) (io.ReadCloser, error) {
 	return &sessionReader{Reader: stdout, session: session}, nil
 }
 
-func (r *Remote) CreateAtomic(_ context.Context, target string, mode fs.FileMode) (AtomicWriter, error) {
+func (r *Remote) createAtomic(_ context.Context, target string, mode fs.FileMode) (AtomicWriter, error) {
 	temporary := path.Join(path.Dir(target), ".dragfm-partial-"+randomSuffix())
 	if r.sftp != nil {
 		file, err := r.sftp.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
@@ -278,6 +303,11 @@ func (r *Remote) CreateAtomic(_ context.Context, target string, mode fs.FileMode
 }
 
 func (r *Remote) MkdirAll(ctx context.Context, target string, mode fs.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if entry, err := r.Stat(ctx, target); err == nil {
 		if !entry.IsDir() {
 			return fmt.Errorf("directory %q is not a real directory", target)
@@ -296,6 +326,11 @@ func (r *Remote) MkdirAll(ctx context.Context, target string, mode fs.FileMode) 
 }
 
 func (r *Remote) Symlink(ctx context.Context, linkTarget, target string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp != nil {
 		return r.sftp.Symlink(linkTarget, target)
 	}
@@ -303,6 +338,11 @@ func (r *Remote) Symlink(ctx context.Context, linkTarget, target string) error {
 }
 
 func (r *Remote) Chmod(ctx context.Context, target string, mode fs.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp != nil {
 		return r.sftp.Chmod(target, mode.Perm())
 	}
@@ -310,6 +350,11 @@ func (r *Remote) Chmod(ctx context.Context, target string, mode fs.FileMode) err
 }
 
 func (r *Remote) Chtimes(ctx context.Context, target string, atime, mtime time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if r.sftp != nil {
 		return r.sftp.Chtimes(target, atime, mtime)
 	}
@@ -317,6 +362,11 @@ func (r *Remote) Chtimes(ctx context.Context, target string, atime, mtime time.T
 }
 
 func (r *Remote) Remove(ctx context.Context, target string, recursive bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -331,6 +381,11 @@ func (r *Remote) Remove(ctx context.Context, target string, recursive bool) erro
 }
 
 func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stopIO := r.watchIO(ctx)
+	defer stopIO()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -379,7 +434,9 @@ func (r *Remote) Exec(ctx context.Context, command string, options ExecOptions) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	stopOpen := r.watchIO(ctx)
 	session, err := r.client.NewSession()
+	stopOpen()
 	if err != nil {
 		return err
 	}

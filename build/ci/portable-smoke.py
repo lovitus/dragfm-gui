@@ -36,7 +36,7 @@ def main() -> None:
         subprocess.run(['icacls', str(root), '/inheritance:r', '/grant:r', user + ':(OI)(CI)F'], check=True, timeout=15)
     child = None
     try:
-        (root / 'SMOKE_ONLY').write_text('dragfm-native-smoke-v1\n')
+        (root / 'SMOKE_ONLY').write_bytes(b'dragfm-native-smoke-v1\n')
         source, target = root / 'source', root / 'target'
         source.mkdir(); target.mkdir(); (target / 'archive').mkdir()
         space = source / "space [brackets] it's $literal"
@@ -46,13 +46,13 @@ def main() -> None:
         (source / 'delete.txt').write_bytes(b'Confirmed delete fixture\n')
         expected = digest(source / 'source.txt')
         password = os.urandom(24).hex()
-        script = (project / 'build/ci/portable-smoke.js').read_text()
+        script = (project / 'build/ci/portable-smoke.js').read_text(encoding='utf-8')
         history = []
         for phase in ('exercise', 'restore'):
             plan = dict(phase=phase, platform='windows' if os.name == 'nt' else sys.platform,
                         password=password, source=str(source), target=str(target),
                         spacePath=str(space), hash=digest(source / 'hash.txt'), historyIDs=history)
-            (root / 'smoke.js').write_text('window.__dragfmSmokePlan=' + json.dumps(plan) + ';\n' + script)
+            (root / 'smoke.js').write_text('window.__dragfmSmokePlan=' + json.dumps(plan) + ';\n' + script, encoding='utf-8', newline='\n')
             report = root / 'report.json'
             report.unlink(missing_ok=True)
             with (evidence / (phase + '.log')).open('wb') as log:
@@ -62,7 +62,7 @@ def main() -> None:
                 while child.poll() is None and time.monotonic() < deadline:
                     if report.exists() and not captured:
                         captured = True
-                        result = json.loads(report.read_text())
+                        result = json.loads(report.read_text(encoding='utf-8'))
                         # Never capture the unlock screen or credential editor.
                         if result.get('success') and sys.platform == 'darwin':
                             subprocess.run(['screencapture', '-x', str(evidence / (phase + '.png'))], check=False, timeout=5)
@@ -74,7 +74,7 @@ def main() -> None:
                     raise RuntimeError('Native platform acceptance timed out')
             if not report.exists():
                 raise RuntimeError(f'Native executable exited {child.returncode} without a report; inspect {phase}.log')
-            result = json.loads(report.read_text())
+            result = json.loads(report.read_text(encoding='utf-8'))
             shutil.copyfile(report, evidence / (phase + '.json'))
             print(json.dumps(result, ensure_ascii=True, indent=2), flush=True)
             if child.returncode != 0 or result.get('success') is not True:
