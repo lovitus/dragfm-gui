@@ -30,6 +30,7 @@ jobs:
     env:
       TARGET_OS: ${{ matrix.goos }}
       TARGET_ARCH: ${{ matrix.goarch }}
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +67,9 @@ jobs:
               go build -mod=vendor -trimpath -buildvcs=false -tags production,webkit2_41 -ldflags='-s -w' -o platform-output/dragfm-gui ./cmd/dragfm-wails
             fi
           fi
+      - name: Windows file-identity and child-process cancellation regressions
+        if: runner.os == 'Windows'
+        run: go test -mod=vendor -count=1 -timeout=2m -run 'TestWindowsFileIdentity|TestLocalCommandCancellation' ./internal/endpoint
       - name: Native window, local filesystem, PTY and process-restart acceptance
         run: |
           set -euo pipefail

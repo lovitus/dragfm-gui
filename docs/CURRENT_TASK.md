@@ -1,11 +1,9 @@
-# 当前任务游标
+# 当前交付游标
 
-- 当前批次：迁移临时源码到私有 GitHub 仓库，创建需求/未完成清单 Draft PR。
-- 基线：Wails 主线、保留 Fyne、vendor、Linux agent/官方 Hans 资源；此前无 Git 提交。
-- 组织：main 空基线，开发分支一个完整迁移提交；不自动合并或发布。
-- 排除：dist、vault、node_modules、缓存、frontend 生成物、凭据与私有日志；历史口令示例替换为 EXAMPLE 值。
-- 中断恢复：外置磁盘失联导致新增文档丢失，恢复后重建并检查；不把失败暂存视为提交。
-- 本次真实冒烟：未执行原生登录/远端传输，未启动 GUI；迁移不等于恢复完成。
-- 历史产物：2026-08-20 macOS arm64 review，历史 SHA256 ac6ef13fa5eb4e4404af5d947771d32b990121faaab352ba260cd59c05a66873，非本次构建。
-- 需求见 USER_REQUIREMENTS.md，缺口见 UNFINISHED.md；REQUIREMENTS.md 的 Implemented 只表示代码存在。
-- 唯一下一步：实际成品入口真实 SSH 双任务传输与历史恢复闭环。后续测试/build/release 用 GitHub workflow，不用私有 runner。
+源码迁移已扩展为 Wails 功能修复、深度安全复审、真实 SSH 策略验收与公开六平台候选发布。原始需求保留在 `USER_REQUIREMENTS.md`，自动化映射见 `ACCEPTANCE.md`，外部证书与环境边界见 `UNFINISHED.md`。
+
+维护入口：`cmd/dragfm-wails`。旧 `cmd/dragfm-gui` 是保留的 Fyne 原型，不应作为新版验收入口。
+
+提交不等于发布。最终结果是 `.github/workflows/release.yml` 完整成功、release 非 draft，并附带六个 OS/CPU 包、对应源码、`PROVENANCE.json`、`TEST_EVIDENCE.zip`、`PACKAGED_TEST_EVIDENCE.zip` 和 `SHA256SUMS`。任一 gate 失败就保留失败证据，不把该候选称为完成。
+
+中断恢复时，先读取 PR 当前 head、该 SHA 的三个 workflow 和 release 状态；不得只根据本游标或历史成功徽章宣称新提交通过。不要启动用户设备、私有 runner、真实私人服务器或旧保险库。凭据夹具只存在于 hosted runner 临时目录。
