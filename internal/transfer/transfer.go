@@ -1,0 +1,579 @@
+package transfer
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/lovitus/dragfm-gui/internal/endpoint"
+)
+
+type Operation struct {
+	Source, Destination    endpoint.Endpoint
+	SourcePath, TargetPath string
+	Move, Overwrite        bool
+	Progress               func(Progress)
+}
+
+type Progress struct {
+	Stage      string
+	Path       string
+	BytesDone  int64
+	BytesTotal int64
+	FilesDone  int
+	FilesTotal int
+	Method     string
+}
+
+type Result struct {
+	Copied       bool
+	Moved        bool
+	SourceKept   bool
+	Bytes        int64
+	Files        int
+	Verification string
+}
+
+type Manifest struct {
+	Items      []ManifestItem
+	Bytes      int64
+	RootDevice uint64
+	RootInode  uint64
+}
+
+type ManifestItem struct {
+	Relative   string
+	Mode       fs.FileMode
+	Size       int64
+	ModifiedNS int64
+	LinkTarget string
+	SHA256     string
+	SourcePath string
+}
+
+var ErrSourceChanged = PreserveSource(errors.New("源文件在传输期间发生变化"))
+
+func Run(ctx context.Context, operation Operation) (Result, error) {
+	if operation.Source == nil || operation.Destination == nil {
+		return Result{}, errors.New("transfer endpoints are required")
+	}
+	if operation.SourcePath == "" || operation.TargetPath == "" {
+		return Result{}, errors.New("source and target paths are required")
+	}
+	if err := validateOperationPaths(ctx, operation); err != nil {
+		return Result{}, err
+	}
+	if operation.Move {
+		if result, done, err := tryNativeMove(ctx, operation); done {
+			return result, err
+		}
+	} else if result, done, err := tryNativeCopy(ctx, operation); done {
+		return result, err
+	}
+	strong := operation.Move
+	emit(operation, Progress{Stage: "snapshot", Path: operation.SourcePath})
+	before, err := Snapshot(ctx, operation.Source, operation.SourcePath, strong)
+	if err != nil {
+		return Result{}, fmt.Errorf("snapshot source: %w", err)
+	}
+	copyOperation, stagedRoot, err := prepareRootCopy(ctx, operation, before.Items[0])
+	if err != nil {
+		return Result{}, err
+	}
+	if stagedRoot != "" {
+		defer func() {
+			if stagedRoot != "" {
+				_ = operation.Destination.Remove(context.Background(), stagedRoot, before.Items[0].Mode.IsDir())
+			}
+		}()
+	}
+	progress := Progress{Stage: "copy", BytesTotal: before.Bytes, FilesTotal: regularFileCount(before), Method: "controller-stream"}
+	for _, item := range orderedForCopy(before.Items) {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		target := targetPath(copyOperation, item.Relative)
+		if err := verifyCopyParents(ctx, copyOperation, target); err != nil {
+			return Result{}, err
+		}
+		progress.Path = item.Relative
+		emit(operation, progress)
+		if err := copyItem(ctx, copyOperation, item, target, &progress); err != nil {
+			return Result{}, fmt.Errorf("copy %q: %w", item.Relative, err)
+		}
+	}
+	if err := applyDirectoryMetadata(ctx, copyOperation, before.Items); err != nil {
+		return Result{}, err
+	}
+	if stagedRoot != "" {
+		if err := commitStagedRoot(ctx, operation, stagedRoot, before.Items[0]); err != nil {
+			return Result{}, fmt.Errorf("commit staged root: %w", err)
+		}
+		stagedRoot = ""
+	}
+
+	result := Result{Copied: true, Bytes: before.Bytes, Files: regularFileCount(before)}
+	if !strong {
+		result.Verification = "atomic-write"
+		return result, nil
+	}
+	emit(operation, Progress{Stage: "verify", BytesTotal: before.Bytes, FilesTotal: result.Files})
+	afterSource, err := Snapshot(ctx, operation.Source, operation.SourcePath, true)
+	if err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, PreserveSource(fmt.Errorf("re-snapshot source: %w", err))
+	}
+	if err := CompareManifests(before, afterSource, false); err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, errors.Join(ErrSourceChanged, err)
+	}
+	afterTarget, err := Snapshot(ctx, operation.Destination, operation.TargetPath, true)
+	if err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, PreserveSource(fmt.Errorf("snapshot target: %w", err))
+	}
+	if err := CompareManifests(before, afterTarget, true); err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, PreserveSource(fmt.Errorf("目标校验失败，源文件已保留: %w", err))
+	}
+	if err := VerifySourceUnchanged(ctx, operation.Source, operation.SourcePath, before); err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files}, err
+	}
+	if err := operation.Source.Remove(ctx, operation.SourcePath, before.Items[0].Mode.IsDir()); err != nil {
+		return Result{Copied: true, SourceKept: true, Bytes: result.Bytes, Files: result.Files, Verification: "sha256"}, PreserveSource(fmt.Errorf("已复制并校验，但删除源失败: %w", err))
+	}
+	result.Moved = true
+	result.Verification = "sha256"
+	emit(operation, Progress{Stage: "done", BytesDone: before.Bytes, BytesTotal: before.Bytes, FilesDone: result.Files, FilesTotal: result.Files})
+	return result, nil
+}
+
+func applyDirectoryMetadata(ctx context.Context, operation Operation, items []ManifestItem) error {
+	ordered := orderedForCopy(items)
+	for index := len(ordered) - 1; index >= 0; index-- {
+		item := ordered[index]
+		if !item.Mode.IsDir() {
+			continue
+		}
+		target := targetPath(operation, item.Relative)
+		if err := operation.Destination.Chmod(ctx, target, item.Mode); err != nil {
+			return err
+		}
+		if err := operation.Destination.Chtimes(ctx, target, item.ModifiedTime(), item.ModifiedTime()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tryNativeCopy(ctx context.Context, operation Operation) (Result, bool, error) {
+	sourceIdentity, sourceErr := operation.Source.Identity(ctx)
+	targetIdentity, targetErr := operation.Destination.Identity(ctx)
+	if sourceErr != nil || targetErr != nil || sourceIdentity.MachineID == "" || sourceIdentity.MachineID != targetIdentity.MachineID {
+		return Result{}, false, nil
+	}
+	copier, ok := operation.Source.(endpoint.NativeCopier)
+	if !ok {
+		return Result{}, false, nil
+	}
+	sourceInfo, err := operation.Source.Stat(ctx, operation.SourcePath)
+	if err != nil {
+		return Result{}, true, err
+	}
+	if targetInfo, statErr := operation.Destination.Stat(ctx, operation.TargetPath); statErr == nil {
+		if !operation.Overwrite {
+			return Result{}, true, fs.ErrExist
+		}
+		// Directory merges need per-file atomic writers, not cp truncating the
+		// existing destination in place. Keep every old file until its copy is ready.
+		if sourceInfo.IsDir() && targetInfo.IsDir() {
+			return Result{}, false, nil
+		}
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return Result{}, true, statErr
+	}
+	staged, err := stagingPath(operation.TargetPath)
+	if err != nil {
+		return Result{}, true, err
+	}
+	defer operation.Source.Remove(context.Background(), staged, sourceInfo.IsDir())
+	emit(operation, Progress{Stage: "native-cp", Path: operation.SourcePath, Method: "cp"})
+	if err := copier.CopyNative(ctx, operation.SourcePath, staged, sourceInfo.IsDir(), false); err != nil {
+		if ctx.Err() != nil {
+			return Result{}, true, ctx.Err()
+		}
+		return Result{}, false, nil // Different users may require destination-side writes.
+	}
+	if err := operation.Destination.Rename(ctx, staged, operation.TargetPath, operation.Overwrite); err != nil {
+		return Result{}, true, err
+	}
+	return Result{Copied: true, Files: 1, Bytes: sourceInfo.Size, Verification: "same-machine-cp"}, true, nil
+}
+
+func tryNativeMove(ctx context.Context, operation Operation) (Result, bool, error) {
+	sourceIdentity, sourceErr := operation.Source.Identity(ctx)
+	targetIdentity, targetErr := operation.Destination.Identity(ctx)
+	if sourceErr != nil || targetErr != nil || sourceIdentity.MachineID == "" || sourceIdentity.MachineID != targetIdentity.MachineID {
+		return Result{}, false, nil
+	}
+	sourceInfo, err := operation.Source.Stat(ctx, operation.SourcePath)
+	if err != nil {
+		return Result{}, true, err
+	}
+	targetInfo, targetErr := operation.Destination.Stat(ctx, operation.TargetPath)
+	if targetErr == nil {
+		if !operation.Overwrite {
+			return Result{}, true, fs.ErrExist
+		}
+		if sourceInfo.Mode.IsDir() && targetInfo.Mode.IsDir() {
+			return Result{}, false, nil
+		}
+	} else if !errors.Is(targetErr, fs.ErrNotExist) {
+		return Result{}, true, targetErr
+	}
+	emit(operation, Progress{Stage: "native-mv", Path: operation.SourcePath, Method: "mv"})
+	if err := operation.Source.Rename(ctx, operation.SourcePath, operation.TargetPath, operation.Overwrite); err != nil {
+		return Result{}, false, nil
+	}
+	return Result{Copied: true, Moved: true, Files: 1, Bytes: sourceInfo.Size, Verification: "same-machine-rename"}, true, nil
+}
+
+func Snapshot(ctx context.Context, source endpoint.Endpoint, root string, hashFiles bool) (Manifest, error) {
+	entry, err := source.Stat(ctx, root)
+	if err != nil {
+		return Manifest{}, err
+	}
+	manifest := Manifest{}
+	if provider, ok := source.(interface {
+		FileVersion(context.Context, string) (uint64, uint64, error)
+	}); ok {
+		manifest.RootDevice, manifest.RootInode, _ = provider.FileVersion(ctx, root)
+	}
+	if err := snapshotItem(ctx, source, root, "", entry, hashFiles, &manifest); err != nil {
+		return Manifest{}, err
+	}
+	sort.Slice(manifest.Items, func(i, j int) bool { return manifest.Items[i].Relative < manifest.Items[j].Relative })
+	return manifest, nil
+}
+
+func snapshotItem(ctx context.Context, source endpoint.Endpoint, path, relative string, entry endpoint.Entry, hashFiles bool, manifest *Manifest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	item := ManifestItem{Relative: relative, Mode: entry.Mode, Size: entry.Size, ModifiedNS: entry.Modified.UnixNano(), LinkTarget: entry.LinkTarget, SourcePath: path}
+	if entry.Mode.IsRegular() {
+		manifest.Bytes += entry.Size
+		if hashFiles {
+			hash, err := hashFile(ctx, source, path)
+			if err != nil {
+				return err
+			}
+			item.SHA256 = hash
+		}
+	}
+	manifest.Items = append(manifest.Items, item)
+	if !entry.Mode.IsDir() {
+		return nil
+	}
+	children, err := source.List(ctx, path)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		childRelative := child.Name
+		if relative != "" {
+			childRelative = relative + "/" + child.Name
+		}
+		if err := snapshotItem(ctx, source, child.Path, childRelative, child, hashFiles, manifest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyItem(ctx context.Context, operation Operation, item ManifestItem, target string, progress *Progress) error {
+	if item.Mode.IsDir() {
+		if err := ensureCopyDirectory(ctx, operation.Destination, target); err != nil {
+			return err
+		}
+		return nil
+	}
+	if item.Mode&fs.ModeSymlink != 0 {
+		// Never unlink the previous destination before the new link exists.
+		if err := operation.Destination.MkdirAll(ctx, operation.Destination.Dir(target), 0700); err != nil {
+			return err
+		}
+		staged, err := stagingPath(target)
+		if err != nil {
+			return err
+		}
+		defer operation.Destination.Remove(context.Background(), staged, false)
+		if err := operation.Destination.Symlink(ctx, item.LinkTarget, staged); err != nil {
+			return err
+		}
+		return operation.Destination.Rename(ctx, staged, target, operation.Overwrite)
+	}
+	if !item.Mode.IsRegular() {
+		return fmt.Errorf("unsupported file type %s", item.Mode.Type())
+	}
+	if err := operation.Destination.MkdirAll(ctx, operation.Destination.Dir(target), 0700); err != nil {
+		return err
+	}
+	if !operation.Overwrite {
+		if _, err := operation.Destination.Stat(ctx, target); err == nil {
+			return fs.ErrExist
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	reader, err := operation.Source.Open(ctx, item.SourcePath)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	writer, err := operation.Destination.CreateAtomic(ctx, target, item.Mode)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = writer.Abort()
+		}
+	}()
+	buffer := make([]byte, 256*1024)
+	var copied int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		count, readErr := reader.Read(buffer)
+		if count > 0 {
+			copied += int64(count)
+			if copied > item.Size {
+				return ErrSourceChanged
+			}
+			written, writeErr := writer.Write(buffer[:count])
+			progress.BytesDone += int64(written)
+			emit(operation, *progress)
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != count {
+				return io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	if copied != item.Size {
+		return ErrSourceChanged
+	}
+	if err := writer.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	if err := operation.Destination.Chmod(ctx, target, item.Mode); err != nil {
+		return err
+	}
+	if err := operation.Destination.Chtimes(ctx, target, item.ModifiedTime(), item.ModifiedTime()); err != nil {
+		return err
+	}
+	progress.FilesDone++
+	return nil
+}
+
+func (item ManifestItem) ModifiedTime() (value time.Time) {
+	return time.Unix(0, item.ModifiedNS)
+}
+
+func hashFile(ctx context.Context, source endpoint.Endpoint, path string) (string, error) {
+	reader, err := source.Open(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+	hash := sha256.New()
+	buffer := make([]byte, 256*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		count, readErr := reader.Read(buffer)
+		if count > 0 {
+			_, _ = hash.Write(buffer[:count])
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return "", readErr
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func CompareManifests(expected, actual Manifest, ignoreModified bool) error {
+	if !ignoreModified && expected.RootInode != 0 && actual.RootInode != 0 && (expected.RootDevice != actual.RootDevice || expected.RootInode != actual.RootInode) {
+		return errors.New("source root identity changed")
+	}
+	if len(expected.Items) == 0 || len(actual.Items) == 0 {
+		return errors.New("empty verification manifest")
+	}
+	if !ignoreModified && len(expected.Items) != len(actual.Items) {
+		return errors.New("source entry set changed")
+	}
+	actualByRelative := make(map[string]ManifestItem, len(actual.Items))
+	for _, item := range actual.Items {
+		if _, exists := actualByRelative[item.Relative]; exists {
+			return fmt.Errorf("duplicate manifest entry %q", item.Relative)
+		}
+		actualByRelative[item.Relative] = item
+	}
+	seen := make(map[string]bool, len(expected.Items))
+	for _, wanted := range expected.Items {
+		if seen[wanted.Relative] {
+			return fmt.Errorf("duplicate source entry %q", wanted.Relative)
+		}
+		seen[wanted.Relative] = true
+		got, ok := actualByRelative[wanted.Relative]
+		if !ok {
+			return fmt.Errorf("missing %q", wanted.Relative)
+		}
+		if wanted.Mode.Type() != got.Mode.Type() || (wanted.Mode.IsRegular() && wanted.Size != got.Size) || wanted.LinkTarget != got.LinkTarget || wanted.SHA256 != got.SHA256 {
+			return fmt.Errorf("content mismatch %q", wanted.Relative)
+		}
+		if !ignoreModified && (wanted.ModifiedNS != got.ModifiedNS || wanted.Mode.Perm() != got.Mode.Perm()) {
+			return fmt.Errorf("source metadata changed %q", wanted.Relative)
+		}
+	}
+	return nil
+}
+
+func prepareRootCopy(ctx context.Context, operation Operation, root ManifestItem) (Operation, string, error) {
+	existing, err := operation.Destination.Stat(ctx, operation.TargetPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		staged, stageErr := stagingPath(operation.TargetPath)
+		if stageErr != nil {
+			return Operation{}, "", stageErr
+		}
+		copy := operation
+		copy.TargetPath, copy.Overwrite = staged, false
+		return copy, staged, nil
+	}
+	if err != nil {
+		return Operation{}, "", err
+	}
+	if !operation.Overwrite {
+		return Operation{}, "", fs.ErrExist
+	}
+	if root.Mode.IsDir() && existing.Mode.IsDir() {
+		return operation, "", nil
+	}
+	staged, stageErr := stagingPath(operation.TargetPath)
+	if stageErr != nil {
+		return Operation{}, "", stageErr
+	}
+	copy := operation
+	copy.TargetPath, copy.Overwrite = staged, false
+	return copy, staged, nil
+}
+
+func commitStagedRoot(ctx context.Context, operation Operation, staged string, root ManifestItem) error {
+	// A failed rename (permissions, cancellation, incompatible file types) is
+	// not permission to delete the old destination and retry destructively.
+	return operation.Destination.Rename(ctx, staged, operation.TargetPath, operation.Overwrite)
+}
+
+func stagingPath(target string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return target + ".dragfm-partial-" + hex.EncodeToString(nonce[:]), nil
+}
+
+func validateOperationPaths(ctx context.Context, operation Operation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sourcePath, err := operation.Source.Abs(ctx, operation.SourcePath)
+	if err != nil {
+		return err
+	}
+	targetPath, err := operation.Destination.Abs(ctx, operation.TargetPath)
+	if err != nil {
+		return err
+	}
+	if sourcePath != operation.SourcePath || targetPath != operation.TargetPath {
+		return errors.New("transfer paths must be absolute and normalized")
+	}
+	if operation.Source.Dir(sourcePath) == sourcePath || operation.Destination.Dir(targetPath) == targetPath {
+		return errors.New("refusing to transfer a filesystem root")
+	}
+	sourceID, sourceErr := operation.Source.Identity(ctx)
+	targetID, targetErr := operation.Destination.Identity(ctx)
+	if sourceErr != nil || targetErr != nil || sourceID.MachineID == "" || sourceID.MachineID != targetID.MachineID {
+		return nil
+	}
+	sourcePath, targetPath, err = physicalOperationPaths(ctx, operation, sourcePath, targetPath)
+	if err != nil {
+		return err
+	}
+	if sourcePath == targetPath {
+		return errors.New("source and destination are the same path")
+	}
+	// Endpoint-aware ancestry checks work with both POSIX and Windows paths.
+	for parent := operation.Destination.Dir(targetPath); ; parent = operation.Destination.Dir(parent) {
+		if parent == sourcePath {
+			return errors.New("destination is inside the source tree")
+		}
+		if parent == operation.Destination.Dir(parent) {
+			break
+		}
+	}
+	return nil
+}
+
+func targetPath(operation Operation, relative string) string {
+	if relative == "" {
+		return operation.TargetPath
+	}
+	parts := append([]string{operation.TargetPath}, strings.Split(relative, "/")...)
+	return operation.Destination.Join(parts...)
+}
+
+func orderedForCopy(items []ManifestItem) []ManifestItem {
+	result := append([]ManifestItem(nil), items...)
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Mode.IsDir() != result[j].Mode.IsDir() {
+			return result[i].Mode.IsDir()
+		}
+		return strings.Count(result[i].Relative, "/") < strings.Count(result[j].Relative, "/")
+	})
+	return result
+}
+
+func regularFileCount(manifest Manifest) int {
+	count := 0
+	for _, item := range manifest.Items {
+		if item.Mode.IsRegular() {
+			count++
+		}
+	}
+	return count
+}
+
+func emit(operation Operation, progress Progress) {
+	if operation.Progress != nil {
+		operation.Progress(progress)
+	}
+}

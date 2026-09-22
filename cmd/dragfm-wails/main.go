@@ -1,0 +1,73 @@
+package main
+
+import (
+	"github.com/lovitus/dragfm-gui/internal/endpoint"
+	"io/fs"
+	"os"
+	"path/filepath"
+
+	"github.com/lovitus/dragfm-gui/frontend"
+	"github.com/lovitus/dragfm-gui/internal/rsyncbridge"
+	"github.com/lovitus/dragfm-gui/internal/vault"
+	"github.com/lovitus/dragfm-gui/internal/webgui"
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+)
+
+func main() {
+	if handled, code := endpoint.FilesystemChildMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+	if handled, code := rsyncbridge.ChildMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+	smoke, err := readNativeSmoke(os.Args[1:])
+	if err != nil {
+		panic(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		executable = filepath.Join(".", "dragfm-gui")
+	}
+	var vaultPath string
+	if smoke != nil {
+		vaultPath = filepath.Join(smoke.directory, "vault.json")
+	} else {
+		vaultPath, err = vault.Locate(executable)
+		if err != nil {
+			panic(err)
+		}
+	}
+	assets, err := fs.Sub(frontend.Assets, "dist")
+	if err != nil {
+		panic(err)
+	}
+	app := webgui.New(vaultPath)
+	application := &options.App{
+		Title:                    "dragfm",
+		Width:                    1440,
+		Height:                   860,
+		MinWidth:                 1080,
+		MinHeight:                680,
+		DisableResize:            false,
+		Frameless:                false,
+		StartHidden:              false,
+		WindowStartState:         options.Normal,
+		EnableDefaultContextMenu: true,
+		AssetServer:              &assetserver.Options{Assets: assets},
+		OnStartup:                app.Startup,
+		OnShutdown:               app.Shutdown,
+		Bind:                     []interface{}{app},
+	}
+	if smoke != nil {
+		application.OnDomReady = smoke.domReady
+	}
+	err = wails.Run(application)
+	if err != nil {
+		panic(err)
+	}
+	if smoke != nil && !smoke.succeeded() {
+		os.Exit(1)
+	}
+}

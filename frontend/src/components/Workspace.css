@@ -1,0 +1,14 @@
+/* Keep optional error banners in normal layout instead of creating an implicit
+   third grid row below a full-height workspace. */
+.workspace[data-theme] { display: flex; flex-direction: column; }
+.workspace[data-theme] > .appbar { height: 44px; flex: none; }
+.workspace[data-theme] > .workspace-grid { flex: 1; }
+.operation-error { display: flex; flex: none; align-items: center; gap: 1rem; padding: .6rem 1rem; max-height: 96px; overflow: auto; border-bottom: 1px solid var(--danger); color: var(--danger); overflow-wrap: anywhere; }
+.operation-error span { flex: 1; }
+.file-pane .file-table-header, .file-pane .file-row { grid-template-columns: minmax(80px, 1fr) 62px 112px 83px; }
+.file-pane .file-spacer { min-width: 100%; }
+.file-pane .file-mode, .file-pane .file-table-header span:last-child { display: block; }
+.file-pane .file-modified { font-size: 10px; }
+.file-pane .pane-toolbar { grid-template-columns: 21px 96px minmax(70px, 1fr) 28px 28px; }
+.file-pane .terminal-panel { max-height: 55%; }
+.file-pane.drop-current .file-list-shell { box-shadow: inset 0 0 0 2px var(--accent); }

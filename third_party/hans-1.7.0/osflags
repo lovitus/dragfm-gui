@@ -1,0 +1,62 @@
+#!/bin/sh
+
+OS=`uname | tr "a-z" "A-Z"`
+MODE=`echo "$2" | tr "a-z" "A-Z"`
+
+case $1 in
+ld)
+    case $OS in
+        DARWIN)
+            if [ "$MODE" == TUNEMU ]; then
+                echo build/tunemu.o -lpcap
+            fi
+        ;;
+    esac
+    ;;
+libs)
+    case $OS in
+        CYGWIN*)
+            echo -ladvapi32
+        ;;
+    esac
+    ;;
+c)
+    case $OS in
+        LINUX)
+            echo $FLAGS -D_GNU_SOURCE -DHAVE_LINUX_IF_TUN_H -DLINUX
+        ;;
+        CYGWIN*)
+            echo $FLAGS -DWIN32
+        ;;
+        *)
+            echo $FLAGS
+        ;;
+    esac
+    ;;
+dev)
+    case $OS in
+        LINUX)
+            echo src/tun_dev_linux.c
+        ;;
+        FREEBSD)
+            echo src/tun_dev_freebsd.c
+        ;;
+        OPENBSD)
+            echo src/tun_dev_openbsd.c
+        ;;
+        DARWIN)
+            if [ "$MODE" == TUNEMU ]; then
+                echo src/tun_dev_darwin_emu.c
+            else
+                echo src/tun_dev_utun.c
+            fi
+        ;;
+        CYGWIN*)
+            echo src/tun_dev_cygwin.c
+        ;;
+        *)
+            echo src/tun_dev_generic.c
+        ;;
+    esac
+    ;;
+esac

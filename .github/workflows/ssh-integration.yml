@@ -1,0 +1,39 @@
+name: real-ssh-integration
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: ssh-integration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  ssh-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Prepare evidence directory and validate shell scripts
+        run: |
+          mkdir -p test-results
+          printf '%s\n' "$GITHUB_SHA" > test-results/COMMIT.txt
+          find build -name '*.sh' -type f -print0 | xargs -0 -n1 bash -n
+      - name: Rebuild embedded agents from the checked-out source
+        run: ./build/build-linux-agents.sh
+      - name: Real SSH transfers, queue, history, sudo, proxies and Hans
+        run: ./build/ci/ssh-integration.sh
+      - name: Preserve integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-ssh-evidence
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: error

@@ -1,0 +1,184 @@
+name: tested-public-release
+on:
+  push:
+    branches: ['release/v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release-candidate tag, for example v0.2.0-rc.1'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: public-release-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  intent:
+    if: github.repository == 'lovitus/dragfm-gui'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Require an explicit release identifier
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME#release/}}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]] || { echo 'Invalid release-candidate tag'; exit 1; }
+          printf 'value=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+  validate:
+    needs: intent
+    uses: ./.github/workflows/build.yml
+  ssh:
+    needs: intent
+    uses: ./.github/workflows/ssh-integration.yml
+  platforms:
+    needs: intent
+    uses: ./.github/workflows/platforms.yml
+  package:
+    needs: [validate, ssh, platforms]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm --prefix frontend ci --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dragfm-gui-*
+          path: release-input
+      - name: Package exact native-tested bytes and corresponding source
+        run: python3 build/ci/package-release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-release-bundle
+          path: release-bundle/
+          if-no-files-found: error
+  verify-package:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, goos: linux, goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64 }
+          - { runner: windows-2025, goos: windows, goarch: amd64 }
+          - { runner: windows-11-arm, goos: windows, goarch: arm64 }
+          - { runner: macos-15-intel, goos: darwin, goarch: amd64 }
+          - { runner: macos-15, goos: darwin, goarch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET_OS: ${{ matrix.goos }}
+      TARGET_ARCH: ${{ matrix.goarch }}
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dragfm-gui-release-bundle
+          path: release-bundle
+      - name: Install Linux runtime dependencies, not a compiler toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgtk-3-0 libwebkit2gtk-4.1-0 xvfb dbus-x11
+      - name: Verify all downloaded assets and the extracted executable
+        run: python build/ci/extract-release.py
+      - name: Exercise the actual extracted distribution on its native OS and CPU
+        run: |
+          set -euo pipefail
+          if [ "$TARGET_OS" = linux ]; then
+            ! ldd unpacked/dragfm-gui/dragfm-gui | grep 'not found'
+            GDK_BACKEND=x11 dbus-run-session -- xvfb-run -a -s '-screen 0 1920x1080x24' python build/ci/portable-smoke.py unpacked/dragfm-gui/dragfm-gui
+          elif [ "$TARGET_OS" = windows ]; then
+            python build/ci/portable-smoke.py unpacked/dragfm-gui/dragfm-gui.exe
+          else
+            codesign --verify --verbose=2 unpacked/dragfm-gui/dragfm-gui
+            python build/ci/portable-smoke.py unpacked/dragfm-gui/dragfm-gui
+            if [ "$TARGET_ARCH" = arm64 ]; then
+              python build/ci/native-smoke.py unpacked/dragfm-gui/dragfm-gui
+            fi
+          fi
+      - name: Retain extracted-package acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-packaged-native-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            platform-output/evidence/
+            test-results/native-macos-arm64/
+          if-no-files-found: warn
+  publish:
+    needs: [intent, verify-package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dragfm-gui-release-bundle
+          path: release-bundle
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dragfm-gui-packaged-native-*
+          path: packaged-evidence
+      - name: Retain second-run evidence with the release assets
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, zipfile
+          output=pathlib.Path('release-bundle')
+          evidence=pathlib.Path('packaged-evidence')
+          with zipfile.ZipFile(output/'PACKAGED_TEST_EVIDENCE.zip','w',compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(evidence.rglob('*')):
+                  if path.is_file(): archive.write(path,path.relative_to(evidence))
+          files=sorted(path for path in output.iterdir() if path.name!='SHA256SUMS')
+          with (output/'SHA256SUMS').open('w') as sums:
+              for path in files:
+                  with path.open('rb') as file: digest=hashlib.file_digest(file,'sha256').hexdigest()
+                  sums.write(f'{digest}  {path.name}\n')
+          PY
+      - name: Publish only after downloading and rechecking every uploaded asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.intent.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq '.visibility')" = public
+          current=$(gh api "repos/$GH_REPO/git/ref/${GITHUB_REF#refs/}" --jq '.object.sha')
+          test "$current" = "$GITHUB_SHA" || { echo 'Source superseded'; exit 1; }
+          (cd release-bundle && sha256sum --check SHA256SUMS)
+          gh release create "$RELEASE_TAG" release-bundle/* --target "$GITHUB_SHA" --draft --prerelease --latest=false \
+            --title "dragfm-gui $RELEASE_TAG — six-platform release candidate" --notes-file release-bundle/RELEASE_NOTES.md
+          gh release download "$RELEASE_TAG" --dir downloaded-release
+          (cd downloaded-release && sha256sum --check SHA256SUMS)
+          current=$(gh api "repos/$GH_REPO/git/ref/${GITHUB_REF#refs/}" --jq '.object.sha')
+          test "$current" = "$GITHUB_SHA" || { echo 'Source advanced; preserving draft only'; exit 1; }
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease=true --latest=false
+          gh release view "$RELEASE_TAG" --json url,isDraft,isPrerelease,tagName,assets > release-result.json
+          python3 - <<'PY'
+          import json, os
+          result=json.load(open('release-result.json'))
+          assert result['tagName']==os.environ['RELEASE_TAG'] and not result['isDraft'] and result['isPrerelease']
+          print(result['url'])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragfm-gui-published-release
+          path: release-result.json
+          if-no-files-found: error
