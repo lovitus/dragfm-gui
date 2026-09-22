@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/lovitus/dragfm-gui/internal/boundedbuf"
 	"io"
 	"io/fs"
 	"os"
@@ -17,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lovitus/dragfm-gui/internal/boundedbuf"
 )
 
 // SudoLocal uses the ordinary endpoint where possible and narrowly scoped
@@ -197,23 +198,21 @@ func (s *SudoLocal) takeOwnership(ctx context.Context, path string) error {
 }
 
 func (s *SudoLocal) run(ctx context.Context, program string, args ...string) error {
-	command, stdin, stderr, err := s.command(ctx, program, args...)
-	if err != nil {
-		return err
-	}
+	command, stderr := s.newCommand(ctx, program, args...)
 	command.Stdout = io.Discard
-	if err := command.Start(); err != nil {
-		return err
-	}
 	if s.password != "" {
-		if _, err := io.WriteString(stdin, s.password+"\n"); err != nil {
-			_ = stdin.Close()
-			_ = command.Wait()
-			return err
-		}
+		// NOPASSWD/cached sudo may finish without reading a supplied password.
+		// Let os/exec own the stdin copy and process wait: its pipe-copy handling
+		// tolerates an unused pipe only while retaining the real exit status.
+		// A synchronous password Write followed by an early return on EPIPE
+		// incorrectly reported successful chmod/chown operations as failures.
+		command.Stdin = strings.NewReader(s.password + "\n")
 	}
-	_ = stdin.Close()
-	if err := command.Wait(); err != nil {
+	err := command.Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
 		message := strings.TrimSpace(stderr.String())
 		if message == "" {
 			message = err.Error()
@@ -223,7 +222,7 @@ func (s *SudoLocal) run(ctx context.Context, program string, args ...string) err
 	return nil
 }
 
-func (s *SudoLocal) command(ctx context.Context, program string, args ...string) (*exec.Cmd, io.WriteCloser, *boundedbuf.Buffer, error) {
+func (s *SudoLocal) newCommand(ctx context.Context, program string, args ...string) (*exec.Cmd, *boundedbuf.Buffer) {
 	sudoArgs := []string{"-n", "--", program}
 	if s.password != "" {
 		sudoArgs = []string{"-S", "-p", "", "--", program}
@@ -231,12 +230,19 @@ func (s *SudoLocal) command(ctx context.Context, program string, args ...string)
 	sudoArgs = append(sudoArgs, args...)
 	command := exec.CommandContext(ctx, "sudo", sudoArgs...)
 	command.WaitDelay = 2 * time.Second
+	stderr := &boundedbuf.Buffer{}
+	command.Stderr = stderr
+	return command, stderr
+}
+
+func (s *SudoLocal) command(ctx context.Context, program string, args ...string) (*exec.Cmd, io.WriteCloser, *boundedbuf.Buffer, error) {
+	command, stderr := s.newCommand(ctx, program, args...)
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	stderr := &boundedbuf.Buffer{}
-	command.Stderr = stderr
+	// Framed filesystem reads/writes still use their explicit stream. This
+	// is deliberately separate from the credential-only non-streaming run.
 	return command, stdin, stderr, nil
 }
 

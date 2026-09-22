@@ -81,6 +81,11 @@ jobs:
         run: |
           set -euo pipefail
           xvfb-run -a go test -mod=vendor -tags=x11,webkit2_41 -race -count=1 -timeout=5m -json ./internal/... | tee test-results/go-race.jsonl
+      - name: Repeat sudo credential and process-exit regressions under the race detector
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=vendor -race -count=20 -timeout=3m -json ./internal/endpoint -run '^TestSudo(AtomicWriterKeepsCredentialAndDataStreamsSeparate|RunClosedUnusedPasswordPipePreservesExitStatus|RunCancelledContextDoesNotBecomeSuccess)$' | tee test-results/sudo-race-repeat.jsonl
       - name: Vet all Go packages
         run: go vet -mod=vendor -tags=x11,webkit2_41 ./...
       - name: Retain test evidence even on failure
