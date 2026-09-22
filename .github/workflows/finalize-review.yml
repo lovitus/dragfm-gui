@@ -1,0 +1,44 @@
+name: apply-final-reviewed-lifecycle-fixes
+on:
+  pull_request:
+    paths: ['.github/workflows/finalize-review.yml']
+permissions:
+  contents: read
+jobs:
+  apply:
+    if: github.event.pull_request.number == 1 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'migration/source-and-requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Apply exact reviewed edits and format first-party Go sources
+        run: |
+          python3 build/ci/finalize-review.py
+          git ls-files -z '*.go' ':!:vendor/*' ':!:third_party/*' | xargs -0 gofmt -w
+          git diff --check
+      - name: Validate frontend compilation before committing
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend test -- --run
+          npm --prefix frontend run build
+      - name: Commit source edits and remove this completed one-time helper
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/finalize-review.yml build/ci/finalize-review.py
+          git add -u
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: bound command cancellation and recover rejected terminal navigation'
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH"

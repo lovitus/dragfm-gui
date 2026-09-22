@@ -1,0 +1,25 @@
+from pathlib import Path
+
+def edit(file, before, after):
+ p=Path(file);s=p.read_text()
+ if s.count(before)!=1: raise RuntimeError(f'{file}: expected one match, found {s.count(before)} for {before[:100]!r}')
+ p.write_text(s.replace(before,after))
+
+edit('internal/endpoint/local.go', 'cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = options.Directory, options.Stdin, options.Stdout, options.Stderr\n\treturn cmd.Run()', 'cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = options.Directory, options.Stdin, options.Stdout, options.Stderr\n\tconfigureCommandCancellation(cmd)\n\terr := cmd.Run()\n\tif ctx.Err() != nil { return ctx.Err() }\n\treturn err')
+edit('internal/endpoint/ssh.go', '\tcase <-ctx.Done():\n\t\t_ = session.Close()\n\t\t<-done\n\t\treturn ctx.Err()\n\t}\n}\n\nfunc (r *Remote) OpenPTY', '\tcase <-ctx.Done():\n\t\treturn r.cancelCommand(ctx, session, done)\n\t}\n}\n\nfunc (r *Remote) OpenPTY')
+edit('internal/webgui/terminal.go','terminalCDCommand(abs)', 'terminalCDForEndpoint(session.endpoint, abs)')
+edit('frontend/src/components/TerminalPane.tsx', 'active, onCWD }: { pane: PaneID; path: string; active: boolean; onCWD: (path: string) => void }', 'active, onCWD, onSyncFailure }: { pane: PaneID; path: string; active: boolean; onCWD: (path: string) => void; onSyncFailure?: () => void }')
+edit('frontend/src/components/TerminalPane.tsx', '  const activeRef = useRef(active)', '  const onSyncFailureRef = useRef(onSyncFailure)\n  onSyncFailureRef.current = onSyncFailure\n  const activeRef = useRef(active)')
+edit('frontend/src/components/TerminalPane.tsx', 'if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => reportErrorRef.current(reason))', 'if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => {\n      // A refused cd (editing/running program) is not an acknowledgement.\n      // Release the navigation gate so the next genuine shell prompt can\n      // reconcile the pane; never silently queue keystrokes into that program.\n      onSyncFailureRef.current?.()\n      reportErrorRef.current(reason)\n    })')
+edit('frontend/src/components/FilePane.tsx','  onRefresh: () => void', '  onRefresh: () => void\n  onSyncFailure?: () => void')
+edit('frontend/src/components/FilePane.tsx','onCWD={(next) => props.onNavigate(next, true)} />', 'onCWD={(next) => props.onNavigate(next, true)} onSyncFailure={props.onSyncFailure} />')
+edit('frontend/src/components/Workspace.tsx','          onRefresh={() => void load(pane)}', '          onRefresh={() => void load(pane)}\n          onSyncFailure={() => cwdGates.current[pane].clear()}')
+edit('cmd/dragfm-wails/native_smoke.go','\t"path/filepath"', '\t"path/filepath"\n\tgoruntime "runtime"')
+edit('cmd/dragfm-wails/native_smoke.go','info.Mode().Perm()&0077 != 0', '(goruntime.GOOS != "windows" && info.Mode().Perm()&0077 != 0)')
+edit('build/build-wails-macos.sh','GOARCH=arm64 CGO_ENABLED=1', 'GOARCH="${DRAGFM_MAC_ARCH:-arm64}" CGO_ENABLED=1')
+edit('build/build-wails-macos.sh','-o "$output_dir/dragfm-gui-wails-darwin-arm64"', '-o "$output_dir/dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}"')
+edit('build/build-wails-macos.sh','shasum -a 256 dragfm-gui-wails-darwin-arm64', 'shasum -a 256 "dragfm-gui-wails-darwin-${DRAGFM_MAC_ARCH:-arm64}"')
+edit('build/ci/native-smoke.js',"      (await wait('running cancellation control rendered', () => document.querySelector('.running-line button'))).click();", "      const cancelStarted = Date.now();\n      (await wait('running cancellation control rendered', () => document.querySelector('.running-line button'))).click();")
+edit('build/ci/native-smoke.js', "      await complete(running.id, 'cancelled');", "      await complete(running.id, 'cancelled');\n      assert(Date.now() - cancelStarted < 5000, 'SSH cancellation took longer than five seconds');")
+edit('frontend/src/test/setup.ts', "import '@testing-library/jest-dom/vitest'", "import '@testing-library/jest-dom/vitest'\n// jsdom does not implement layout; native acceptance covers real geometry.\nObject.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [] })\nObject.defineProperty(Range.prototype, 'getBoundingClientRect', { configurable: true, value: () => new DOMRect() })")
+edit('build/ci/ssh-integration.sh', 'HostedReviewedHansRolesAndMethods)', 'HostedReviewedHansRolesAndMethods|HostedSSHCommandCancellationLatency)')
