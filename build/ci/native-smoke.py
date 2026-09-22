@@ -29,6 +29,7 @@ class ThrottledSSH:
         self.listener.listen()
         self.stopped = threading.Event()
         self.connections: list[socket.socket] = []
+        self.transfers: list[dict] = []
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.accept, daemon=True)
         self.thread.start()
@@ -39,30 +40,52 @@ class ThrottledSSH:
                 downstream, _ = self.listener.accept()
                 upstream = socket.create_connection(('127.0.0.1', self.destination), timeout=10)
                 upstream.settimeout(None)
+                # Only the explicit byte-rate limiter should delay this fixture.
+                # Nagle plus delayed ACKs can otherwise add per-request latency
+                # to SSH/SFTP's bidirectional protocol and dwarf the intended
+                # rate, making the unchanged 64 MiB acceptance nondeterministic.
+                downstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 return
             with self.lock:
                 self.connections.extend((downstream, upstream))
-            threading.Thread(target=self.relay, args=(downstream, upstream), daemon=True).start()
-            threading.Thread(target=self.relay, args=(upstream, downstream), daemon=True).start()
+            threading.Thread(target=self.relay, args=(downstream, upstream, 'to-server'), daemon=True).start()
+            threading.Thread(target=self.relay, args=(upstream, downstream, 'to-client'), daemon=True).start()
 
-    def relay(self, source: socket.socket, target: socket.socket) -> None:
+    def relay(self, source: socket.socket, target: socket.socket, direction: str) -> None:
+        state = dict(direction=direction, bytes=0, started=time.monotonic(), last_io=None, closed=False)
+        with self.lock:
+            self.transfers.append(state)
         try:
             while not self.stopped.is_set():
                 data = source.recv(65536)
                 if not data:
                     break
                 target.sendall(data)
+                with self.lock:
+                    state['bytes'] += len(data)
+                    state['last_io'] = time.monotonic()
                 # Slow the genuine encrypted SSH data stream, not the app or
                 # its queue: make Running+Pending overlap deterministic.
                 self.stopped.wait(len(data) / (4 * 1024 * 1024))
         except OSError:
             pass
         finally:
+            with self.lock:
+                state['closed'] = True
             try:
                 target.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
+
+    def snapshot(self) -> list[dict]:
+        now = time.monotonic()
+        with self.lock:
+            return [dict(direction=s['direction'], wire_bytes=s['bytes'],
+                         elapsed_seconds=round(now-s['started'], 3),
+                         idle_seconds=round(now-s['last_io'], 3) if s['last_io'] else None,
+                         closed=s['closed']) for s in self.transfers]
 
     def close(self) -> None:
         self.stopped.set()
@@ -199,6 +222,10 @@ Subsystem sftp internal-sftp
                 while app.poll() is None and time.monotonic() < deadline:
                     if report_path.exists() and not captured:
                         captured = True
+                        # Numeric transport diagnostics contain no payloads,
+                        # keys or tokens and distinguish slow traffic from EOF
+                        # deadlocks without weakening any acceptance deadline.
+                        (evidence / f'{phase}-wire.json').write_text(json.dumps(proxy.snapshot(), indent=2) + '\n')
                         # Failure may leave the private-key editor visible.
                         # Only capture completed acceptance screens, never keys.
                         if json.loads(report_path.read_text()).get('success'):
