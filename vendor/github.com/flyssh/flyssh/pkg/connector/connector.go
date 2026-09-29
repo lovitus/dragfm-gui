@@ -46,9 +46,12 @@ type Hop struct {
 }
 
 type Credentials struct {
-	UseAgent    bool
-	Password    string
-	PrivateKeys []PrivateKey
+	UseAgent bool
+	// AgentTimeout optionally bounds a noninteractive initiating helper's
+	// agent connection and signing. Zero preserves the CLI's existing policy.
+	AgentTimeout time.Duration
+	Password     string
+	PrivateKeys  []PrivateKey
 }
 
 type PrivateKey struct {
@@ -254,7 +257,10 @@ func authMethods(credentials Credentials) ([]ssh.AuthMethod, func(), error) {
 	}
 	if credentials.UseAgent {
 		if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-			if conn, err := net.Dial("unix", socket); err == nil {
+			if conn, err := net.DialTimeout("unix", socket, credentials.AgentTimeout); err == nil {
+				if credentials.AgentTimeout > 0 {
+					_ = conn.SetDeadline(time.Now().Add(credentials.AgentTimeout))
+				}
 				agentSigners, signerErr := agent.NewClient(conn).Signers()
 				if signerErr == nil && len(agentSigners) > 0 {
 					// One publickey method must contain every candidate. Go's SSH

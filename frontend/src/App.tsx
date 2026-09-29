@@ -54,11 +54,12 @@ export default function App() {
       catch (reason) { setError(String(reason)) }
     }
   }
-  const resolve = async (accepted: boolean) => {
+  const resolve = async (accepted: boolean, skip = false) => {
     if (!challenge || challengeBusy) return
     setChallengeBusy(true); setChallengeError('')
     try {
-      await api.resolveChallenge(challenge.id, accepted, challengeValue, challengeSave)
+      if (skip) await api.skipChallenge(challenge.id)
+      else await api.resolveChallenge(challenge.id, accepted, challengeValue, challengeSave)
       setChallenges((queue) => queue.filter((item) => item.id !== challenge.id))
     } catch (reason) { setChallengeError(String(reason)) }
     finally { setChallengeBusy(false) }
@@ -69,7 +70,7 @@ export default function App() {
     {bootstrap?.unlocked ? <Workspace initial={bootstrap} challengeOpen={Boolean(challenge)} onLock={() => void lock()} /> : <Unlock status={status} busy={busy} error={error} onUnlock={(password) => void run(() => api.unlock(password))} onCreate={(hint, password, confirm) => void run(() => api.createVault(hint, password, confirm))} />}
     {challenge && <Modal title={challenge.title}>
       <div className="challenge-body"><p>{challenge.message}</p>{challenge.secret && <label>认证密码<input autoFocus type="password" value={challengeValue} onChange={(event) => setChallengeValue(event.target.value)} /></label>}{challenge.allowSave && <label className="checkbox"><input type="checkbox" checked={challengeSave} onChange={(event) => setChallengeSave(event.target.checked)} />保存到加密保险库</label>}{challengeError && <p role="alert">{challengeError}</p>}</div>
-      <footer className="modal-footer"><span>连接正在等待本次决定。{challenges.length > 1 ? `还有 ${challenges.length - 1} 个确认。` : ''}</span><button className="secondary-button" disabled={challengeBusy} onClick={() => void resolve(false)}>取消</button><button className="primary-button" disabled={challengeBusy} onClick={() => void resolve(true)}>继续</button></footer>
+      <footer className="modal-footer"><span>正在等待本次决定。{challenges.length > 1 ? `还有 ${challenges.length - 1} 个确认。` : ''}</span><button className="secondary-button" disabled={challengeBusy} onClick={() => void resolve(false)}>{challenge.allowSkip ? '取消任务' : '取消'}</button>{challenge.allowSkip && <button className="secondary-button" disabled={challengeBusy} onClick={() => void resolve(false, true)}>跳过此类方法</button>}<button className="primary-button" disabled={challengeBusy} onClick={() => void resolve(true)}>继续</button></footer>
     </Modal>}
   </>
 }

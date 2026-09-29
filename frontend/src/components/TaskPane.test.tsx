@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { HistoryEntry, JobUpdate } from '../types'
 import TaskPane, { formatBytes } from './TaskPane'
@@ -39,6 +39,21 @@ describe('TaskPane status ledger', () => {
 
   it('formats byte totals compactly', () => {
     expect(formatBytes(24 * 1024 * 1024)).toBe('24.0 MiB')
+  })
+
+  it('replaces live transcript snapshots without duplicating lines and keeps failed output accessible', () => {
+    const command = { ...base, description: '命令 · 控制机 · $ example', stage: 'command', method: '', message: '命令执行中', output: 'first-line\n' }
+    const props = { jobs: [command], activity: [command], history: [], activePane: 'left' as const, onCommand: vi.fn(), onCancel: vi.fn() }
+    const { rerender } = render(<TaskPane {...props} />)
+    expect(screen.getByRole('log', { name: '命令输出' })).toHaveTextContent('first-line')
+    expect(screen.queryByText('传输中')).not.toBeInTheDocument()
+    rerender(<TaskPane {...props} jobs={[{ ...command, output: 'first-line\nsecond-line\n' }]} />)
+    expect(screen.getByRole('log', { name: '命令输出' }).textContent?.match(/first-line/g)).toHaveLength(1)
+    const history = [{ id: command.id, operation: command.description, success: false, state: 'failed' as const, output: 'first-line\nsecond-line\n', message: 'exit status 19', finishedAt: new Date().toISOString() }]
+    rerender(<TaskPane {...props} jobs={[]} history={history} />)
+    fireEvent.click(screen.getByRole('button', { name: `查看任务详情：${command.description}` }))
+    expect(screen.getByRole('log', { name: '命令输出' })).toHaveTextContent('exit status 19')
+    expect(screen.getByRole('log', { name: '命令输出' })).toHaveTextContent('second-line')
   })
 })
 

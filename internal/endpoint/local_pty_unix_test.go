@@ -53,9 +53,11 @@ func TestLocalPTYLoadsLoginAndInteractiveEnvironmentWithoutBootstrapLeak(t *test
 		t.Run(filepath.Base(shell), func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
+			t.Setenv("ZDOTDIR", home)
 			for name, body := range map[string]string{
 				".bash_profile": "export DRAGFM_LOGIN_ENV=loaded\n",
 				".bashrc":       "PS1='dragfm-test> '\n",
+				".zshenv":       "skip_global_compinit=1\n",
 				".zprofile":     "export DRAGFM_LOGIN_ENV=loaded\n",
 				".zshrc":        "PROMPT='dragfm-test> '\n",
 			} {

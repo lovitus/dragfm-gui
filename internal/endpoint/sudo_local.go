@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lovitus/dragfm-gui/internal/boundedbuf"
@@ -51,6 +52,15 @@ func (s *SudoLocal) Abs(ctx context.Context, value string) (string, error) {
 }
 func (s *SudoLocal) Join(parts ...string) string { return s.local.Join(parts...) }
 func (s *SudoLocal) Dir(value string) string     { return s.local.Dir(value) }
+func (s *SudoLocal) FileVersion(ctx context.Context, path string) (uint64, uint64, error) {
+	device, inode, err := s.local.FileVersion(ctx, path)
+	if errors.Is(err, fs.ErrPermission) {
+		var version [2]uint64
+		err = s.childResult(ctx, "version", path, &version)
+		device, inode = version[0], version[1]
+	}
+	return device, inode, err
+}
 func (s *SudoLocal) List(ctx context.Context, directory string) ([]Entry, error) {
 	entries, err := s.local.List(ctx, directory)
 	if errors.Is(err, fs.ErrPermission) {
@@ -150,6 +160,10 @@ func (s *SudoLocal) Chmod(ctx context.Context, path string, mode fs.FileMode) er
 		return nil
 	}
 	return s.run(ctx, "chmod", fmt.Sprintf("%04o", mode.Perm()), path)
+}
+
+func (s *SudoLocal) SetOwner(ctx context.Context, path string, uid, gid uint32) error {
+	return s.run(ctx, "chown", "-h", fmt.Sprintf("%d:%d", uid, gid), path)
 }
 
 func (s *SudoLocal) Chtimes(ctx context.Context, path string, atime, mtime time.Time) error {
@@ -262,15 +276,19 @@ func (r *sudoReadCloser) Close() error {
 }
 
 type sudoAtomicWriter struct {
-	endpoint *SudoLocal
-	ctx      context.Context
-	command  *exec.Cmd
-	stdin    io.WriteCloser
-	stderr   *boundedbuf.Buffer
-	partial  string
-	target   string
-	mode     fs.FileMode
-	done     bool
+	endpoint    *SudoLocal
+	ctx         context.Context
+	command     *exec.Cmd
+	stdin       io.WriteCloser
+	stderr      *boundedbuf.Buffer
+	partial     string
+	target      string
+	mode        fs.FileMode
+	done        bool
+	closeOnce   sync.Once
+	closeErr    error
+	prepareOnce sync.Once
+	prepareErr  error
 }
 
 func (w *sudoAtomicWriter) Write(data []byte) (int, error) {
@@ -281,26 +299,19 @@ func (w *sudoAtomicWriter) Write(data []byte) (int, error) {
 }
 
 func (w *sudoAtomicWriter) Close() error {
-	if w.done {
-		return nil
-	}
-	return w.stdin.Close()
+	w.closeOnce.Do(func() { w.closeErr = w.stdin.Close() })
+	return w.closeErr
 }
 
 func (w *sudoAtomicWriter) Commit() error {
 	if w.done {
 		return errors.New("atomic writer already completed")
 	}
+	_, prepareErr := w.PrepareStaged()
 	w.done = true
-	closeErr := w.stdin.Close()
-	waitErr := w.command.Wait()
-	if closeErr != nil || waitErr != nil {
+	if prepareErr != nil {
 		_ = w.cleanup()
-		message := strings.TrimSpace(w.stderr.String())
-		if message != "" {
-			waitErr = fmt.Errorf("sudo tee 失败: %s", message)
-		}
-		return errors.Join(closeErr, waitErr)
+		return prepareErr
 	}
 	if err := w.endpoint.run(w.ctx, "chmod", fmt.Sprintf("%04o", w.mode.Perm()), w.partial); err != nil {
 		_ = w.cleanup()
@@ -317,15 +328,26 @@ func (w *sudoAtomicWriter) Commit() error {
 	return nil
 }
 
+func (w *sudoAtomicWriter) PrepareStaged() (string, error) {
+	w.prepareOnce.Do(func() {
+		closeErr := w.Close()
+		waitErr := w.command.Wait()
+		if waitErr != nil && strings.TrimSpace(w.stderr.String()) != "" {
+			waitErr = fmt.Errorf("sudo 文件写入失败: %w: %s", waitErr, strings.TrimSpace(w.stderr.String()))
+		}
+		w.prepareErr = errors.Join(closeErr, waitErr)
+	})
+	return w.partial, w.prepareErr
+}
+
 func (w *sudoAtomicWriter) Abort() error {
 	if w.done {
 		return nil
 	}
 	w.done = true
-	closeErr := w.stdin.Close()
-	waitErr := w.command.Wait()
+	_, prepareErr := w.PrepareStaged()
 	removeErr := w.cleanup()
-	return errors.Join(closeErr, waitErr, removeErr)
+	return errors.Join(prepareErr, removeErr)
 }
 
 func rejectFilesystemRoot(path string) error {

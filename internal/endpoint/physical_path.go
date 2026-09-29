@@ -34,10 +34,17 @@ func (l *Local) PhysicalPath(ctx context.Context, value string) (string, error) 
 }
 
 func (s *SudoLocal) PhysicalPath(ctx context.Context, value string) (string, error) {
-	return s.local.PhysicalPath(ctx, value)
+	resolved, err := s.local.PhysicalPath(ctx, value)
+	if errors.Is(err, fs.ErrPermission) {
+		err = s.childResult(ctx, "physical", value, &resolved)
+	}
+	return resolved, err
 }
 
 func (r *Remote) PhysicalPath(ctx context.Context, value string) (string, error) {
+	if r.physicalPath != nil {
+		return r.physicalPath(ctx, value)
+	}
 	directory := path.Dir(value)
 	tail := []string{path.Base(value)}
 	for {

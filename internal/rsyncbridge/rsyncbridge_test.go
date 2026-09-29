@@ -17,7 +17,12 @@ func TestRsyncServerArgumentsRejectsArbitraryCommands(t *testing.T) {
 	if err != nil || len(valid) != 5 || valid[0] != "rsync" {
 		t.Fatalf("valid command rejected: %#v %v", valid, err)
 	}
-	for _, arguments := range [][]string{{"dragfm", "sh", "-c", "id"}, {"dragfm", "rsync", "--daemon"}} {
+	for _, arguments := range [][]string{
+		{"dragfm", "sh", "-c", "id"}, {"dragfm", "rsync", "--daemon"},
+		{"dragfm", "rsync", "--server-malformed", "-a", ".", "/tmp/out"},
+		{"dragfm", "rsync", "--server", "-s"},
+		{"dragfm", "rsync", "--server", "-a", "/tmp/first", "/tmp/second"},
+	} {
 		if _, err := rsyncServerArguments(arguments); err == nil {
 			t.Fatalf("unsafe command accepted: %#v", arguments)
 		}

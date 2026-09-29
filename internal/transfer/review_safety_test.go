@@ -20,6 +20,18 @@ type reviewEndpoint struct {
 func (e reviewEndpoint) Identity(context.Context) (endpoint.Identity, error) {
 	return endpoint.Identity{MachineID: e.id}, nil
 }
+func (e reviewEndpoint) FileVersion(ctx context.Context, path string) (uint64, uint64, error) {
+	return e.Endpoint.(interface {
+		FileVersion(context.Context, string) (uint64, uint64, error)
+	}).FileVersion(ctx, path)
+}
+
+func (e reviewEndpoint) SyncPaths(ctx context.Context, paths []string) error {
+	return e.Endpoint.(interface {
+		SyncPaths(context.Context, []string) error
+	}).SyncPaths(ctx, paths)
+}
+
 func (e reviewEndpoint) Open(ctx context.Context, path string) (io.ReadCloser, error) {
 	r, err := e.Endpoint.Open(ctx, path)
 	if err != nil {

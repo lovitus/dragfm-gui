@@ -333,6 +333,9 @@ func TestCommitRefusesOverwriteWithoutExplicitChoice(t *testing.T) {
 }
 
 func TestCleanupStaleTempsRequiresValidExpiredOwnershipMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("remote workspace ownership and flock are Unix-only")
+	}
 	root := t.TempDir()
 	makeDirectory := func(name string, marker any, mode os.FileMode) string {
 		directory := filepath.Join(root, name)
@@ -347,12 +350,15 @@ func TestCleanupStaleTempsRequiresValidExpiredOwnershipMarker(t *testing.T) {
 		}
 		return directory
 	}
-	old := ownershipMarker{Version: 1, Created: time.Now().Add(-48 * time.Hour), Nonce: "old"}
-	recent := ownershipMarker{Version: 1, Created: time.Now(), Nonce: "recent"}
+	// Version 1 without an agent PID could belong to a live system ncat
+	// transfer. Only the version-2 lock contract proves this fixture is idle.
+	old := ownershipMarker{Version: 2, Created: time.Now().Add(-48 * time.Hour), Nonce: "old"}
+	recent := ownershipMarker{Version: 2, Created: time.Now(), Nonce: "recent"}
 	valid := makeDirectory(".dragfm-old", old, 0600)
-	keep := makeDirectory(".dragfm-keep", ownershipMarker{Version: 1, Created: old.Created, Nonce: "keep"}, 0600)
-	invalid := makeDirectory(".dragfm-invalid", ownershipMarker{Version: 1, Created: old.Created, Nonce: "different"}, 0600)
-	worldReadable := makeDirectory(".dragfm-world", ownershipMarker{Version: 1, Created: old.Created, Nonce: "world"}, 0644)
+	keep := makeDirectory(".dragfm-keep", ownershipMarker{Version: 2, Created: old.Created, Nonce: "keep"}, 0600)
+	invalid := makeDirectory(".dragfm-invalid", ownershipMarker{Version: 2, Created: old.Created, Nonce: "different"}, 0600)
+	worldReadable := makeDirectory(".dragfm-world", ownershipMarker{Version: 2, Created: old.Created, Nonce: "world"}, 0644)
+	legacy := makeDirectory(".dragfm-legacy", ownershipMarker{Version: 1, Created: old.Created, Nonce: "legacy"}, 0600)
 	recentPath := makeDirectory(".dragfm-recent", recent, 0600)
 	if err := cleanupOwnedTemps(root, keep, 24*time.Hour); err != nil {
 		t.Fatal(err)
@@ -360,7 +366,7 @@ func TestCleanupStaleTempsRequiresValidExpiredOwnershipMarker(t *testing.T) {
 	if _, err := os.Stat(valid); !os.IsNotExist(err) {
 		t.Fatalf("valid stale directory remains: %v", err)
 	}
-	for _, preserved := range []string{keep, invalid, worldReadable, recentPath} {
+	for _, preserved := range []string{keep, invalid, worldReadable, recentPath, legacy} {
 		if _, err := os.Stat(preserved); err != nil {
 			t.Fatalf("unsafe cleanup removed %s: %v", preserved, err)
 		}

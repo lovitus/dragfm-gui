@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	appconfig "github.com/lovitus/dragfm-gui/internal/config"
 	"golang.org/x/crypto/argon2"
@@ -139,10 +140,33 @@ func migrate(document *appconfig.Document) error {
 	}
 	switch document.Version {
 	case 0:
-		document.Version = 1
 		if document.UI.Theme == "" {
 			document.UI.Theme = "system"
 		}
+		fallthrough
+	case 1:
+		for index := range document.Hosts {
+			host := &document.Hosts[index]
+			for _, password := range host.HopPasswords {
+				if password != "" {
+					host.UnverifiedPasswords = append(host.UnverifiedPasswords, password)
+				}
+			}
+			host.HopPasswords = nil
+			if host.RouteSpec != "" && host.Password != "" {
+				host.UnverifiedPasswords = append(host.UnverifiedPasswords, host.Password)
+				host.Password = ""
+			}
+		}
+		for index := range document.SOCKS {
+			proxy := &document.SOCKS[index]
+			if proxy.Spec != "" && !strings.HasPrefix(proxy.Spec, "socks5://") {
+				// V1 treated all shorthand as a URL; don't silently change the
+				// password bytes when a saved %40 is loaded by the new parser.
+				proxy.Spec = "socks5://" + proxy.Spec
+			}
+		}
+		document.Version = appconfig.CurrentVersion
 	case appconfig.CurrentVersion:
 	default:
 		return fmt.Errorf("unsupported vault version %d", document.Version)

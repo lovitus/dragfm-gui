@@ -5,13 +5,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lovitus/dragfm-gui/internal/endpoint"
 )
 
 func TestFilterCWDMarkers(t *testing.T) {
 	t.Parallel()
 	var directory string
-	input := "before\x1b]777;dragfm-cwd=/tmp/work\x07after"
-	output, err := io.ReadAll(filterCWDMarkers(strings.NewReader(input), func(value string) { directory = value }))
+	input := "before\x1b]777;dragfm-cwd=v1;test-session;L3RtcC93b3Jr\x07after"
+	output, err := io.ReadAll(endpoint.FilterCWDMarkers(strings.NewReader(input), "test-session", func(value string) { directory = value }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +26,8 @@ func TestFilterCWDMarkersDoesNotHoldPromptTail(t *testing.T) {
 	t.Parallel()
 	source, input := io.Pipe()
 	defer input.Close()
-	filtered := filterCWDMarkers(source, func(string) {})
+	filtered := endpoint.FilterCWDMarkers(source, "test-session", func(string) {})
+	defer filtered.Close()
 	prompt := []byte("fanli@host /Users % ")
 	go func() { _, _ = input.Write(prompt) }()
 	result := make(chan []byte, 1)

@@ -4,8 +4,8 @@ package endpoint
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -25,7 +25,8 @@ func (l *Local) OpenPTY(ctx context.Context, directory, shell string, rows, colu
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	command, temporary, err := localLoginCommand(shell)
+	nonce := rand.Text()
+	command, temporary, err := localLoginCommand(shell, nonce)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +42,7 @@ func (l *Local) OpenPTY(ctx context.Context, directory, shell string, rows, colu
 		}
 		return nil, err
 	}
-	session := &localPTY{file: file, command: command, temporary: temporary, done: make(chan struct{})}
+	session := &localPTY{file: file, command: command, temporary: temporary, nonce: nonce, done: make(chan struct{})}
 	go func() { session.waitErr = command.Wait(); close(session.done) }()
 	go func() {
 		select {
@@ -57,7 +58,7 @@ func (l *Local) OpenPTY(ctx context.Context, directory, shell string, rows, colu
 // mechanism. This is materially different from typing a bootstrap into the
 // PTY: startup files run after the user's profile/rc, so no command is echoed
 // and the user's environment, aliases and prompt are already in place.
-func localLoginCommand(shell string) (*exec.Cmd, string, error) {
+func localLoginCommand(shell, nonce string) (*exec.Cmd, string, error) {
 	name := strings.ToLower(filepath.Base(shell))
 	switch name {
 	case "zsh":
@@ -65,22 +66,20 @@ func localLoginCommand(shell string) (*exec.Cmd, string, error) {
 		if err != nil {
 			return nil, "", err
 		}
-		original := os.Getenv("ZDOTDIR")
-		if original == "" {
-			original, _ = os.UserHomeDir()
-		}
-		for _, file := range []string{".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"} {
-			body := fmt.Sprintf("[[ -r %s ]] && source %s\nexport ZDOTDIR=%s\n", posixQuote(filepath.Join(original, file)), posixQuote(filepath.Join(original, file)), posixQuote(directory))
-			if file == ".zlogin" {
-				body += zshCWDHook()
-			}
+		original, originalSet := os.LookupEnv("ZDOTDIR")
+		for _, file := range []string{".zshenv", ".zprofile", ".zshrc", ".zlogin"} {
+			body := zshStartup(file, directory, nonce)
 			if err := os.WriteFile(filepath.Join(directory, file), []byte(body), 0600); err != nil {
 				_ = os.RemoveAll(directory)
 				return nil, "", err
 			}
 		}
 		command := exec.Command(shell, "-l", "-i")
-		command.Env = append(os.Environ(), "ZDOTDIR="+directory)
+		set := "0"
+		if originalSet {
+			set = "1"
+		}
+		command.Env = append(os.Environ(), "__DRAGFM_ZDOTDIR="+original, "__DRAGFM_ZDOTDIR_SET="+set, "ZDOTDIR="+directory)
 		return command, directory, nil
 	case "bash":
 		file, err := os.CreateTemp("", "dragfm-bashrc-*")
@@ -88,8 +87,7 @@ func localLoginCommand(shell string) (*exec.Cmd, string, error) {
 			return nil, "", err
 		}
 		path := file.Name()
-		body := `[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
-` + bashCWDHook()
+		body := bashStartup(nonce)
 		if _, err = file.WriteString(body); err != nil {
 			_ = file.Close()
 			_ = os.Remove(path)
@@ -99,16 +97,16 @@ func localLoginCommand(shell string) (*exec.Cmd, string, error) {
 			_ = os.Remove(path)
 			return nil, "", err
 		}
-		return exec.Command(shell, "-l", "-c", `exec "$0" --noprofile --rcfile "$1" -i`, shell, path), path, nil
+		return exec.Command(shell, "--noprofile", "--rcfile", path, "-i"), path, nil
 	case "fish":
-		return exec.Command(shell, "-l", "-i", "-C", fishCWDHook()), "", nil
+		return exec.Command(shell, "-l", "-i", "-C", fishCWDHook(nonce)), "", nil
 	default:
 		file, err := os.CreateTemp("", "dragfm-env-*")
 		if err != nil {
 			return nil, "", err
 		}
 		path := file.Name()
-		if _, err = file.WriteString(posixCWDHook()); err != nil {
+		if _, err = file.WriteString(posixCWDHook(nonce)); err != nil {
 			_ = file.Close()
 			_ = os.Remove(path)
 			return nil, "", err
@@ -123,18 +121,18 @@ func localLoginCommand(shell string) (*exec.Cmd, string, error) {
 	}
 }
 
-func posixQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
-
 type localPTY struct {
 	file      *os.File
 	command   *exec.Cmd
 	temporary string
+	nonce     string
 	once      sync.Once
 	done      chan struct{}
 	waitErr   error
 	closeErr  error
 }
 
+func (p *localPTY) CWDNonce() string      { return p.nonce }
 func (p *localPTY) Input() io.WriteCloser { return p.file }
 func (p *localPTY) Output() io.Reader     { return p.file }
 func (p *localPTY) Resize(rows, columns uint) error {

@@ -2,6 +2,7 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"golang.org/x/crypto/ssh"
@@ -22,9 +23,9 @@ func Run(client *ssh.Client, spec *Spec) (int, error) {
 }
 
 // RunContext runs a transfer and aborts its SSH connection when the context is
-// cancelled. Closing the client is deliberately broad: it guarantees that SCP
-// subprocesses, forwarded channels, and blocked network I/O do not survive a
-// cancelled transfer. Callers should reconnect before reusing the route.
+// cancelled. Closing the client unblocks local I/O, but does not prove remote
+// process exit. Preserve that uncertainty in the returned error. Callers must
+// reconnect before reusing the route.
 func RunContext(ctx context.Context, client *ssh.Client, spec *Spec) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 1, err
@@ -43,7 +44,7 @@ func RunContext(ctx context.Context, client *ssh.Client, spec *Spec) (int, error
 		return result.code, result.err
 	case <-ctx.Done():
 		_ = client.Close()
-		<-done
-		return 1, ctx.Err()
+		result := <-done
+		return 1, errors.Join(ctx.Err(), result.err)
 	}
 }

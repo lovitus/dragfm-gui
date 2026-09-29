@@ -16,9 +16,9 @@ func TestCancelledListenerReadyResultDoesNotBecomeTransportFailure(t *testing.T)
 	for index := 0; index < 100; index++ {
 		ctx, cancel := context.WithCancel(context.Background())
 		service := NewWithContext(ctx)
-		job := &listenerJob{listener: listener, done: make(chan error, 1)}
+		job := &listenerJob{listener: listener, done: make(chan struct{}), err: net.ErrClosed}
 		service.jobs["cancelled"] = job
-		job.done <- net.ErrClosed
+		close(job.done)
 		cancel()
 		// Both select arms are already ready; every scheduling choice must
 		// preserve cancellation rather than falling through to another route.

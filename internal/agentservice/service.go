@@ -32,7 +32,6 @@ import (
 	flytransfer "github.com/flyssh/flyssh/pkg/transfer"
 	"github.com/lovitus/dragfm-gui/internal/activity"
 	"github.com/lovitus/dragfm-gui/internal/agentproto"
-	"github.com/lovitus/dragfm-gui/internal/agentroute"
 	"github.com/lovitus/dragfm-gui/internal/filecommit"
 	"github.com/lovitus/dragfm-gui/internal/rsyncbridge"
 )
@@ -43,11 +42,18 @@ type Service struct {
 	processes map[string]*processJob
 	ctx       context.Context
 	partials  map[string]*ownedPartial
+	cancel    context.CancelFunc
+	closing   bool
+	active    sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
 type listenerJob struct {
 	listener net.Listener
-	done     chan error
+	done     chan struct{}
+	err      error // Published before done closes; multiple joiners may observe it.
+	cancel   context.CancelFunc
 	port     int
 	pin      string
 	address  string
@@ -62,7 +68,8 @@ func NewWithContext(ctx context.Context) *Service {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return &Service{jobs: make(map[string]*listenerJob), processes: make(map[string]*processJob), ctx: ctx}
+	life, cancel := context.WithCancel(ctx)
+	return &Service{jobs: make(map[string]*listenerJob), processes: make(map[string]*processJob), ctx: life, cancel: cancel}
 }
 
 func (s *Service) Handle(request agentproto.Request) agentproto.Response {
@@ -71,6 +78,27 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		response.OK, response.Error = false, "unsupported protocol version"
 		return response
 	}
+	// Shutdown is outside admission so it never waits for its own request.
+	// The once result is shared by concurrent Close/EOF/remove requests.
+	if request.Action == "remove-owned-temp" {
+		err := s.Close()
+		if err == nil {
+			err = removeOwnedTemp(s.ctx, request.Options["path"])
+		}
+		if err != nil {
+			response.OK, response.Error = false, err.Error()
+		}
+		return response
+	}
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		response.OK, response.Error = false, "helper is closing"
+		return response
+	}
+	s.active.Add(1)
+	s.mu.Unlock()
+	defer s.active.Done()
 	var err error
 	var incoming string
 	switch request.Action {
@@ -92,6 +120,24 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 	case "track-partial":
 	case "forget-partial":
 		s.forgetPartial(request.Options["path"])
+	case "filesystem-physical":
+		response.Values["path"], err = physicalParentPath(request.Options["path"])
+	case "filesystem-sync":
+		var paths []string
+		err = json.Unmarshal([]byte(request.Options["paths"]), &paths)
+		if err == nil && (len(paths) == 0 || len(paths) > 64) {
+			err = errors.New("invalid filesystem sync path count")
+		}
+		if err == nil {
+			err = filecommit.SyncPaths(s.ctx, paths)
+		}
+	case "filesystem-owner":
+		uid, uidErr := strconv.ParseUint(request.Options["uid"], 10, 32)
+		gid, gidErr := strconv.ParseUint(request.Options["gid"], 10, 32)
+		err = errors.Join(uidErr, gidErr)
+		if err == nil {
+			err = os.Lchown(request.Options["path"], int(uid), int(gid))
+		}
 	case "probe":
 		response.Values["os"], response.Values["arch"] = runtime.GOOS, runtime.GOARCH
 	case "sha256":
@@ -124,9 +170,6 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		err = probeSOCKSTCP(s.ctx, request.Options["proxy"], request.Options["target"])
 	case "process-stop":
 		err = s.stopProcess(request.Options["job"])
-	case "remove-owned-temp":
-		s.Close()
-		err = removeOwnedTemp(request.Options["path"])
 	case "cleanup-stale-temps":
 		seconds, parseErr := strconv.ParseInt(request.Options["older_seconds"], 10, 64)
 		if parseErr != nil || seconds < 3600 {
@@ -141,6 +184,16 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		}
 	case "path-remove":
 		err = removePath(request.Options["path"], request.Options["directory"] == "true")
+	case "discard-partial":
+		err = s.discardPartial(request.Options["path"])
+	case "filesystem-version":
+		var info os.FileInfo
+		info, err = os.Lstat(request.Options["path"])
+		if err == nil {
+			device, inode := filesystemVersion(info)
+			response.Values["device"] = strconv.FormatUint(device, 10)
+			response.Values["inode"] = strconv.FormatUint(inode, 10)
+		}
 	case "filesystem-manifest":
 		var manifest filesystemManifest
 		manifest, err = buildFilesystemManifest(request.Options["path"])
@@ -151,11 +204,29 @@ func (s *Service) Handle(request agentproto.Request) agentproto.Response {
 		}
 	case "wait":
 		err = s.wait(s.ctx, request.Options["job"])
+	case "listener-stop":
+		err = s.stopListener(request.Options["job"])
 	default:
 		err = errors.New("unsupported action")
 	}
+	if request.Options["journal"] == "true" {
+		records, recordErr := s.partialRecords()
+		if recordErr == nil {
+			data, encodeErr := json.Marshal(records)
+			recordErr = encodeErr
+			response.Values["partials"] = string(data)
+		}
+		if recordErr != nil {
+			err = errors.Join(err, recordErr)
+			response.ErrorCode = "partial_identity_unconfirmed"
+		}
+	}
 	if err != nil {
 		response.OK, response.Error = false, err.Error()
+		var unconfirmed *flytransfer.ExitUnconfirmedError
+		if errors.As(err, &unconfirmed) {
+			response.ErrorCode = "exit_unconfirmed"
+		}
 	}
 	return response
 }
@@ -292,7 +363,7 @@ func commitPathInternal(partial, target string, overwrite bool) error {
 }
 
 func runRsync(ctx context.Context, request agentproto.Request) error {
-	route, err := agentroute.Decode(request.Secret["route"])
+	route, err := decodeInitiatorRoute(request.Secret["route"])
 	if err != nil {
 		return err
 	}
@@ -305,7 +376,7 @@ func runRsync(ctx context.Context, request agentproto.Request) error {
 	if request.Action == "rsync-download" {
 		direction = rsyncbridge.Download
 	}
-	return rsyncbridge.Run(ctx, chain.Final(), direction, request.Options["source"], request.Options["target"])
+	return rsyncbridge.Run(ctx, chain.Final(), direction, request.Options["source"], request.Options["target"], request.Options["peer_helper"])
 }
 
 func tcpProbe(address string) (string, error) {
@@ -322,7 +393,7 @@ func tcpProbe(address string) (string, error) {
 }
 
 func runSCP(ctx context.Context, request agentproto.Request) error {
-	route, err := agentroute.Decode(request.Secret["route"])
+	route, err := decodeInitiatorRoute(request.Secret["route"])
 	if err != nil {
 		return err
 	}
@@ -342,6 +413,9 @@ func runSCP(ctx context.Context, request agentproto.Request) error {
 		flags = append(flags, "-r")
 	}
 	spec := &flytransfer.Spec{Mode: flytransfer.ModeSCP, Direction: direction, Flags: flags, Sources: []string{request.Options["source"]}, Target: request.Options["target"]}
+	if helper := request.Options["peer_helper"]; helper != "" {
+		spec.RemoteCommandPrefix = []string{helper, "--transfer-server"}
+	}
 	code, err := flytransfer.Run(chain.Final(), spec)
 	if err != nil {
 		return err
@@ -361,35 +435,39 @@ func (s *Service) startListener(request agentproto.Request) (*listenerJob, error
 	if err != nil {
 		return nil, err
 	}
-	listener, address, err := listenDataAddress(request.Options["bind"])
+	listener, address, err := listenDataAddress(request.Options["bind"], request.Options["port"])
 	if err != nil {
 		return nil, err
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	job := &listenerJob{listener: listener, done: make(chan error, 1), port: port, pin: pin, address: address}
+	life, cancel := context.WithCancel(s.ctx)
+	job := &listenerJob{listener: listener, done: make(chan struct{}), cancel: cancel, port: port, pin: pin, address: address}
 	s.mu.Lock()
 	if _, exists := s.jobs[jobID]; exists {
 		s.mu.Unlock()
 		_ = listener.Close()
+		cancel()
 		return nil, errors.New("duplicate listener job")
 	}
 	s.jobs[jobID] = job
 	s.mu.Unlock()
 	go func() {
-		stopListener := context.AfterFunc(s.ctx, func() { _ = listener.Close() })
+		defer close(job.done)
+		defer cancel()
+		stopListener := context.AfterFunc(life, func() { _ = listener.Close() })
 		defer stopListener()
 		connection, acceptErr := listener.Accept()
 		_ = listener.Close()
 		if acceptErr != nil {
-			job.done <- acceptErr
+			job.err = acceptErr
 			return
 		}
 		connection = tls.Server(activity.Conn(s.ctx, connection), &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13})
 		defer connection.Close()
-		stopConnection := context.AfterFunc(s.ctx, func() { _ = connection.Close() })
+		stopConnection := context.AfterFunc(life, func() { _ = connection.Close() })
 		defer stopConnection()
 		if err := authenticateDataChannel(connection, token); err != nil {
-			job.done <- err
+			job.err = err
 			return
 		}
 		if request.Action == "listen-receive" {
@@ -397,13 +475,13 @@ func (s *Service) startListener(request agentproto.Request) (*listenerJob, error
 			if err == nil && request.Options["ack"] == "true" {
 				_, err = connection.Write([]byte{1})
 			}
-			job.done <- err
+			job.err = err
 		} else {
 			err := sendArchive(connection, path)
 			if err == nil && request.Options["ack"] == "true" {
 				err = readArchiveReceipt(connection)
 			}
-			job.done <- err
+			job.err = err
 		}
 	}()
 	return job, nil
@@ -412,26 +490,63 @@ func (s *Service) startListener(request agentproto.Request) (*listenerJob, error
 func (s *Service) wait(ctx context.Context, jobID string) error {
 	s.mu.Lock()
 	job := s.jobs[jobID]
-	delete(s.jobs, jobID)
 	s.mu.Unlock()
 	if job == nil {
 		return errors.New("unknown listener job")
 	}
+	defer s.forgetStoppedListener(jobID, job)
 	select {
-	case err := <-job.done:
+	case <-job.done:
 		// Closing the listener on cancellation also readies job.done. Either
 		// select arm may win; preserve cancellation rather than treating the
 		// resulting socket error as a retryable transport failure.
-		if err != nil && ctx.Err() != nil {
+		if job.err != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return err
+		return job.err
 	case <-ctx.Done():
-		_ = job.listener.Close()
-		return ctx.Err()
+		return errors.Join(ctx.Err(), stopListenerJob(job))
 	case <-time.After(10 * time.Minute):
-		_ = job.listener.Close()
-		return errors.New("listener job timed out")
+		return errors.Join(errors.New("listener job timed out"), stopListenerJob(job))
+	}
+}
+
+func (s *Service) stopListener(jobID string) error {
+	s.mu.Lock()
+	job := s.jobs[jobID]
+	s.mu.Unlock()
+	if job == nil {
+		return errors.New("unknown listener job")
+	}
+	defer s.forgetStoppedListener(jobID, job)
+	return stopListenerJob(job)
+}
+
+func (s *Service) forgetStoppedListener(jobID string, job *listenerJob) {
+	select {
+	case <-job.done:
+		s.mu.Lock()
+		if s.jobs[jobID] == job {
+			delete(s.jobs, jobID)
+		}
+		s.mu.Unlock()
+	default:
+		// Retain timed-out receivers so Close cannot forget a live writer.
+	}
+}
+
+// Stop includes a join, not just Close on the listening socket. The accepted
+// connection may still be writing a partial after the listening socket closed.
+func stopListenerJob(job *listenerJob) error {
+	if job.cancel != nil {
+		job.cancel()
+	}
+	_ = job.listener.Close()
+	select {
+	case <-job.done:
+		return nil
+	case <-time.After(3 * time.Second):
+		return errors.New("data listener did not stop; refusing to reuse its partial")
 	}
 }
 
@@ -444,7 +559,7 @@ func connect(ctx context.Context, request agentproto.Request, sending bool) erro
 	var err error
 	var routeChain *connector.Chain
 	if routePayload := request.Secret["route"]; routePayload != "" {
-		route, decodeErr := agentroute.Decode(routePayload)
+		route, decodeErr := decodeInitiatorRoute(routePayload)
 		if decodeErr != nil {
 			return decodeErr
 		}

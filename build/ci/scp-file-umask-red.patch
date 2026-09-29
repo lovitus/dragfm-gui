@@ -1,0 +1,12 @@
+diff --git a/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go b/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go
+--- a/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go
++++ b/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go
+@@ -657,5 +657,3 @@
+-	if preserve {
+-		if err := file.Chmod(mode); err != nil {
+-			return fmt.Errorf("chmod %s: %w", target, err)
+-		}
+-	}
++	if err := file.Chmod(mode); err != nil {
++		return fmt.Errorf("chmod %s: %w", target, err)
++	}

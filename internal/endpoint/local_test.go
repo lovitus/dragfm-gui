@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLocalAtomicWriter(t *testing.T) {
@@ -29,21 +30,43 @@ func TestLocalAtomicWriter(t *testing.T) {
 	}
 }
 
-func TestLocalListDirectoriesFirst(t *testing.T) {
+func TestLocalListMatchesModificationOrder(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
-	if err := os.WriteFile(filepath.Join(directory, "a-file"), nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(directory, "z-dir"), 0700); err != nil {
-		t.Fatal(err)
+	for _, item := range []struct {
+		name      string
+		seconds   int64
+		directory bool
+	}{
+		{"z-dir", 10, true}, {"new-file", 30, false}, {".hidden", 40, false}, {"a-tie", 20, false}, {"B-tie", 20, false},
+	} {
+		target := filepath.Join(directory, item.name)
+		var err error
+		if item.directory {
+			err = os.Mkdir(target, 0700)
+		} else {
+			err = os.WriteFile(target, nil, 0600)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		modified := time.Unix(1700000000+item.seconds, 0)
+		if err := os.Chtimes(target, modified, modified); err != nil {
+			t.Fatal(err)
+		}
 	}
 	entries, err := NewLocal().List(context.Background(), directory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 || !entries[0].IsDir() {
-		t.Fatalf("unexpected order: %#v", entries)
+	want := []string{".hidden", "new-file", "B-tie", "a-tie", "z-dir"}
+	if len(entries) != len(want) {
+		t.Fatalf("listing count=%d, want=%d", len(entries), len(want))
+	}
+	for i, name := range want {
+		if entries[i].Name != name {
+			t.Fatalf("entry %d=%q want=%q", i, entries[i].Name, name)
+		}
 	}
 }
 

@@ -4,6 +4,7 @@ package endpoint
 
 import (
 	"context"
+	"crypto/rand"
 	"io"
 	"os"
 	"os/exec"
@@ -25,7 +26,8 @@ func (l *Local) OpenPTY(ctx context.Context, directory, _ string, rows, columns 
 	if err != nil {
 		return nil, err
 	}
-	prompt := `function global:prompt { $e=[char]27; Write-Host -NoNewline ("${e}]777;dragfm-cwd=" + $PWD.Path + [char]7); "PS $($PWD.Path)> " }`
+	nonce := rand.Text()
+	prompt := `$global:__dragfm_original_prompt = $function:prompt; function global:prompt { $e=[char]27; $p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PWD.Path)); Write-Host -NoNewline ("${e}]777;dragfm-cwd=v1;` + nonce + `;" + $p + [char]7); if ($global:__dragfm_original_prompt) { & $global:__dragfm_original_prompt } else { "PS $($PWD.Path)> " } }`
 	pid, _, err := console.Spawn(shell, []string{"-NoLogo", "-NoExit", "-Command", prompt}, &syscall.ProcAttr{Env: os.Environ(), Dir: directory})
 	if err != nil {
 		_ = console.Close()
@@ -36,7 +38,7 @@ func (l *Local) OpenPTY(ctx context.Context, directory, _ string, rows, columns 
 		_ = console.Close()
 		return nil, err
 	}
-	session := &windowsPTY{console: console, process: process, done: make(chan struct{})}
+	session := &windowsPTY{console: console, process: process, nonce: nonce, done: make(chan struct{})}
 	go func() { _, session.waitErr = process.Wait(); close(session.done) }()
 	go func() {
 		select {
@@ -51,11 +53,13 @@ func (l *Local) OpenPTY(ctx context.Context, directory, _ string, rows, columns 
 type windowsPTY struct {
 	console           *conpty.ConPty
 	process           *os.Process
+	nonce             string
 	done              chan struct{}
 	waitErr, closeErr error
 	once              sync.Once
 }
 
+func (p *windowsPTY) CWDNonce() string      { return p.nonce }
 func (p *windowsPTY) Input() io.WriteCloser { return p.console.InPipe() }
 func (p *windowsPTY) Output() io.Reader     { return p.console.OutPipe() }
 func (p *windowsPTY) Resize(rows, columns uint) error {

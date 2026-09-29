@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"time"
@@ -12,6 +13,11 @@ import (
 // This ensures Lock cannot wait forever for a silent peer. A closed endpoint is
 // recognized by the application's existing reconnect/generation guard.
 func (r *Remote) watchIO(ctx context.Context) func() {
+	if r.commands != nil {
+		// Command-backed views cancel their own sessions and pipes. A read
+		// timeout must not close the shared SSH identity or prevent cleanup.
+		return func() {}
+	}
 	stop := context.AfterFunc(ctx, func() { _ = r.Close() })
 	return func() { stop() }
 }
@@ -25,7 +31,7 @@ func (r *Remote) Open(ctx context.Context, target string) (io.ReadCloser, error)
 	stop()
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, errors.Join(ctx.Err(), err)
 		}
 		return nil, err
 	}
@@ -46,7 +52,7 @@ func (r *contextReader) Read(data []byte) (int, error) {
 	defer stop()
 	n, err := r.ReadCloser.Read(data)
 	if err != nil && r.ctx.Err() != nil {
-		err = r.ctx.Err()
+		err = errors.Join(r.ctx.Err(), err)
 	}
 	return n, err
 }
@@ -67,7 +73,7 @@ func (r *Remote) CreateAtomic(ctx context.Context, target string, mode fs.FileMo
 	stop()
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, errors.Join(ctx.Err(), err)
 		}
 		return nil, err
 	}
@@ -88,7 +94,7 @@ func (w *contextAtomicWriter) Write(data []byte) (int, error) {
 	defer stop()
 	n, err := w.AtomicWriter.Write(data)
 	if err != nil && w.ctx.Err() != nil {
-		err = w.ctx.Err()
+		err = errors.Join(w.ctx.Err(), err)
 	}
 	return n, err
 }
@@ -107,9 +113,20 @@ func (w *contextAtomicWriter) Commit() error {
 	defer stop()
 	err := w.AtomicWriter.Commit()
 	if err != nil && w.ctx.Err() != nil {
-		err = w.ctx.Err()
+		err = errors.Join(w.ctx.Err(), err)
 	}
 	return err
+}
+
+func (w *contextAtomicWriter) PrepareStaged() (string, error) {
+	prepared, ok := w.AtomicWriter.(StagedWriter)
+	if !ok {
+		return "", errors.ErrUnsupported
+	}
+	stop := w.remote.watchIO(w.ctx)
+	defer stop()
+	path, err := prepared.PrepareStaged()
+	return path, errors.Join(w.ctx.Err(), err)
 }
 func (w *contextAtomicWriter) Abort() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

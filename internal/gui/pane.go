@@ -1,11 +1,9 @@
 package gui
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"math"
 	"strings"
@@ -167,7 +165,7 @@ func (p *filePane) startTerminal() {
 				return
 			}
 			p.pty = pty
-			filtered := filterCWDMarkers(pty.Output(), func(directory string) {
+			filtered := endpoint.FilterCWDMarkers(pty.Output(), pty.CWDNonce(), func(directory string) {
 				fyne.Do(func() {
 					if directory != "" {
 						if directory != p.path.Text {
@@ -177,6 +175,7 @@ func (p *filePane) startTerminal() {
 					}
 				})
 			})
+			defer filtered.Close()
 			go func() {
 				for config := range listen {
 					_ = pty.Resize(config.Rows, config.Columns)
@@ -434,66 +433,4 @@ func (r *fileRow) MouseOut() {
 			r.pane.setDropTarget("")
 		}
 	}
-}
-
-func filterCWDMarkers(source io.Reader, update func(string)) io.Reader {
-	reader, writer := io.Pipe()
-	go func() {
-		defer writer.Close()
-		prefix := []byte("\x1b]777;dragfm-cwd=")
-		buffer := make([]byte, 32*1024)
-		pending := make([]byte, 0, 32*1024)
-		for {
-			count, err := source.Read(buffer)
-			if count > 0 {
-				pending = append(pending, buffer[:count]...)
-				for {
-					start := bytes.Index(pending, prefix)
-					if start < 0 {
-						keep := matchingPrefixSuffix(pending, prefix)
-						if len(pending) > keep {
-							_, _ = writer.Write(pending[:len(pending)-keep])
-							pending = append([]byte(nil), pending[len(pending)-keep:]...)
-						}
-						break
-					}
-					end := bytes.IndexByte(pending[start+len(prefix):], 7)
-					if end < 0 {
-						if start > 0 {
-							_, _ = writer.Write(pending[:start])
-							pending = append([]byte(nil), pending[start:]...)
-						}
-						break
-					}
-					end += start + len(prefix)
-					_, _ = writer.Write(pending[:start])
-					update(string(pending[start+len(prefix) : end]))
-					pending = append([]byte(nil), pending[end+1:]...)
-				}
-			}
-			if err != nil {
-				if len(pending) > 0 {
-					_, _ = writer.Write(pending)
-				}
-				if !errors.Is(err, io.EOF) {
-					_ = writer.CloseWithError(err)
-				}
-				return
-			}
-		}
-	}()
-	return reader
-}
-
-func matchingPrefixSuffix(data, prefix []byte) int {
-	maximum := len(prefix) - 1
-	if len(data) < maximum {
-		maximum = len(data)
-	}
-	for size := maximum; size > 0; size-- {
-		if bytes.Equal(data[len(data)-size:], prefix[:size]) {
-			return size
-		}
-	}
-	return 0
 }

@@ -153,6 +153,7 @@ func localEntry(path string) (Entry, error) {
 		return Entry{}, err
 	}
 	entry := Entry{Name: info.Name(), Path: path, Mode: info.Mode(), Size: info.Size(), Modified: info.ModTime()}
+	entry.UID, entry.GID, entry.OwnerKnown = localFileOwner(info)
 	if info.Mode()&fs.ModeSymlink != 0 {
 		entry.LinkTarget, _ = os.Readlink(path)
 	}
@@ -160,10 +161,11 @@ func localEntry(path string) (Entry, error) {
 }
 
 type localAtomicWriter struct {
-	file      *os.File
-	temporary string
-	target    string
-	done      bool
+	file         *os.File
+	temporary    string
+	target       string
+	done, closed bool
+	closeErr     error
 }
 
 func newLocalAtomicWriter(target string, mode fs.FileMode) (*localAtomicWriter, error) {
@@ -185,10 +187,11 @@ func newLocalAtomicWriter(target string, mode fs.FileMode) (*localAtomicWriter, 
 func (w *localAtomicWriter) Write(data []byte) (int, error) { return w.file.Write(data) }
 
 func (w *localAtomicWriter) Close() error {
-	if w.done {
-		return nil
+	if !w.closed {
+		w.closed = true
+		w.closeErr = w.file.Close()
 	}
-	return w.file.Close()
+	return w.closeErr
 }
 
 func (w *localAtomicWriter) Commit() error {
@@ -196,20 +199,23 @@ func (w *localAtomicWriter) Commit() error {
 		return errors.New("atomic writer already completed")
 	}
 	if err := w.file.Sync(); err != nil {
-		_ = w.Abort()
-		return err
+		return errors.Join(err, w.Abort())
 	}
-	if err := w.file.Close(); err != nil {
-		_ = w.Abort()
-		return err
+	if err := w.Close(); err != nil {
+		return errors.Join(err, w.Abort())
 	}
 	if err := replaceFile(w.temporary, w.target); err != nil {
-		_ = os.Remove(w.temporary)
-		w.done = true
-		return err
+		return errors.Join(err, w.Abort())
 	}
 	w.done = true
 	return nil
+}
+
+func (w *localAtomicWriter) PrepareStaged() (string, error) {
+	if w.done {
+		return w.temporary, errors.New("atomic writer already completed")
+	}
+	return w.temporary, w.Close()
 }
 
 func (w *localAtomicWriter) Abort() error {
@@ -217,7 +223,7 @@ func (w *localAtomicWriter) Abort() error {
 		return nil
 	}
 	w.done = true
-	return errors.Join(w.file.Close(), os.Remove(w.temporary))
+	return errors.Join(w.Close(), os.Remove(w.temporary))
 }
 
 func randomSuffix() string {
@@ -230,10 +236,12 @@ func randomSuffix() string {
 
 func sortEntries(entries []Entry) {
 	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].IsDir() != entries[j].IsDir() {
-			return entries[i].IsDir()
+		// Match ls -allt: mtime descending across files and directories. Equal
+		// timestamps use bytewise names (C locale) for stable cross-host order.
+		if !entries[i].Modified.Equal(entries[j].Modified) {
+			return entries[i].Modified.After(entries[j].Modified)
 		}
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+		return entries[i].Name < entries[j].Name
 	})
 }
 

@@ -27,6 +27,7 @@ type Job struct {
 
 type Update struct {
 	ID, Description, Message string
+	Output                   string // Complete, sanitized, bounded transcript tail (not a delta).
 	State                    State
 	Revision                 uint64
 	Progress                 float64
@@ -35,6 +36,7 @@ type Update struct {
 	Stage, Method            string
 	BytesDone, BytesTotal    int64
 	FilesDone, FilesTotal    int
+	ResetCounters            bool // A new attempt must not inherit a failed method's counters.
 	StartedAt, FinishedAt    time.Time
 	Error                    string
 }
@@ -123,7 +125,9 @@ func (q *Queue) Cancel(id string) bool {
 	}
 	for index, job := range q.pending {
 		if job.ID == id {
-			q.pending = append(q.pending[:index], q.pending[index+1:]...)
+			copy(q.pending[index:], q.pending[index+1:])
+			q.pending[len(q.pending)-1] = Job{}
+			q.pending = q.pending[:len(q.pending)-1]
 			q.recordLocked(cancelledUpdate(job))
 			return true
 		}
@@ -204,6 +208,17 @@ func (q *Queue) recordLocked(update Update) {
 		copy(q.events, q.events[1:])
 		q.events = q.events[:eventLimit-1]
 	}
+	// Consecutive transcript snapshots supersede one another. Do not retain
+	// hundreds of copies when the event consumer is suspended; state/method
+	// transitions still have distinct entries and Snapshot remains authoritative.
+	if n := len(q.events); n > 0 && update.State == Running && update.Output != "" {
+		last := q.events[n-1]
+		if last.ID == update.ID && last.State == Running && last.Stage == update.Stage && last.Method == update.Method && last.Message == update.Message {
+			q.events[n-1] = update
+			signal(q.eventWake)
+			return
+		}
+	}
 	q.events = append(q.events, update)
 	signal(q.eventWake)
 }
@@ -249,6 +264,9 @@ func (q *Queue) execute(ctx context.Context, job Job) {
 		if update.Message == "" {
 			update.Message = last.Message
 		}
+		if update.Output == "" {
+			update.Output = last.Output
+		}
 		if !update.ProgressKnown && !update.Indeterminate {
 			update.Progress, update.ProgressKnown, update.Indeterminate = last.Progress, last.ProgressKnown, last.Indeterminate
 		}
@@ -258,10 +276,10 @@ func (q *Queue) execute(ctx context.Context, job Job) {
 		if update.Method == "" {
 			update.Method = last.Method
 		}
-		if update.BytesDone == 0 && update.BytesTotal == 0 {
+		if !update.ResetCounters && update.BytesDone == 0 && update.BytesTotal == 0 {
 			update.BytesDone, update.BytesTotal = last.BytesDone, last.BytesTotal
 		}
-		if update.FilesDone == 0 && update.FilesTotal == 0 {
+		if !update.ResetCounters && update.FilesDone == 0 && update.FilesTotal == 0 {
 			update.FilesDone, update.FilesTotal = last.FilesDone, last.FilesTotal
 		}
 		q.recordLocked(update)
@@ -277,6 +295,12 @@ func (q *Queue) execute(ctx context.Context, job Job) {
 	}
 	if errors.Is(err, context.Canceled) || (err != nil && ctx.Err() != nil) {
 		final.State, final.Message = Cancelled, "已取消"
+		// Cancellation may carry a cleanup failure or an unconfirmed remote
+		// exit. Keep that detail in the displayed/persisted message, not only
+		// in the internal Error field which older UI clients do not expose.
+		if err != nil && err != ctx.Err() {
+			final.Message += " · " + err.Error()
+		}
 	} else if err != nil {
 		final.State, final.Message = Failed, err.Error()
 	}

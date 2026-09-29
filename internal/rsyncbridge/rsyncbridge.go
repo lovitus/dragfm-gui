@@ -16,7 +16,9 @@ import (
 	"sync"
 	"time"
 
+	flytransfer "github.com/flyssh/flyssh/pkg/transfer"
 	"github.com/lovitus/dragfm-gui/internal/activity"
+	"github.com/lovitus/dragfm-gui/internal/agentlease"
 	"github.com/lovitus/dragfm-gui/internal/boundedbuf"
 	"golang.org/x/crypto/ssh"
 )
@@ -99,7 +101,7 @@ func ChildMain(args []string, stdin io.Reader, stdout, stderr io.Writer) (bool, 
 	return true, 0
 }
 
-func Run(ctx context.Context, client *ssh.Client, direction Direction, source, target string) error {
+func Run(ctx context.Context, client *ssh.Client, direction Direction, source, target string, peerHelper ...string) error {
 	if client == nil {
 		return errors.New("SSH client is required")
 	}
@@ -117,23 +119,38 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 	}
 	defer listener.Close()
 	token := randomToken()
-	rsh := quoteShellWord(executable) + " " + ChildFlag + " " + listener.Addr().String() + " " + token
-	args := []string{"-a", "-e", rsh}
+	// -e uses rsync's own parser, which doubles quotes rather than using
+	// POSIX backslash escapes. The SSH command below is a different layer.
+	rsh := "'" + strings.ReplaceAll(executable, "'", "''") + "' " + ChildFlag + " " + listener.Addr().String() + " " + token
+	args := []string{"-a", "-e", rsh, "--"}
+	var remotePath string
 	switch direction {
 	case Upload:
+		remotePath = target
 		args = append(args, source, "dragfm:"+target)
 	case Download:
+		remotePath = source
 		args = append(args, "dragfm:"+source, target)
 	default:
 		return fmt.Errorf("unknown rsync direction %q", direction)
 	}
 	command := exec.CommandContext(ctx, rsync, args...)
+	// The app owns the protocol/argv policy. Inherited RSYNC_PROTECT_ARGS or
+	// RSYNC_OLD_ARGS must not silently change it. No user credential is added.
+	for _, variable := range os.Environ() {
+		if !strings.HasPrefix(variable, "RSYNC_") {
+			command.Env = append(command.Env, variable)
+		}
+	}
 	configureChildLifecycle(command)
 	command.WaitDelay = 2 * time.Second
 	var localError boundedbuf.Buffer
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = &localError
+	if err := agentlease.Attach(ctx, command); err != nil {
+		return err
+	}
 
 	type accepted struct {
 		connection net.Conn
@@ -176,13 +193,27 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 		return err
 	}
 	commandDone := make(chan error, 1)
-	go func() { commandDone <- command.Wait() }()
+	go func() {
+		err := command.Wait()
+		var exited *exec.ExitError
+		if err != nil && (!errors.As(err, &exited) || !exited.ProcessState.Exited()) {
+			// A signal/WaitDelay can reap the rsync parent without proving
+			// that its receiver workers are gone. Leases still protect them.
+			err = &flytransfer.ExitUnconfirmedError{Cause: err}
+		}
+		commandDone <- err
+	}()
 	killAndWait := func() error {
 		_ = listener.Close()
 		if command.Process != nil {
-			_ = command.Process.Kill()
+			_ = killChild(command)
 		}
-		return <-commandDone
+		select {
+		case err := <-commandDone:
+			return err
+		case <-time.After(3 * time.Second):
+			return &flytransfer.ExitUnconfirmedError{Cause: errors.New("local rsync did not exit; installation lease retained by child")}
+		}
 	}
 	var acceptedResult accepted
 	select {
@@ -190,19 +221,25 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 	case localErr := <-commandDone:
 		return fmt.Errorf("rsync exited before opening its transport: %w: %s", localErr, strings.TrimSpace(localError.String()))
 	case <-ctx.Done():
-		_ = killAndWait()
-		return ctx.Err()
+		return errors.Join(ctx.Err(), killAndWait())
 	case <-time.After(transportHandshakeTimeout):
 		localErr := killAndWait()
 		return fmt.Errorf("rsync did not open its transport within %s: %w: %s", transportHandshakeTimeout, localErr, strings.TrimSpace(localError.String()))
 	}
 	if acceptedResult.err != nil {
-		_ = killAndWait()
-		return acceptedResult.err
+		return errors.Join(acceptedResult.err, killAndWait())
 	}
-	remoteErr := bridgeSSH(ctx, client, acceptedResult.connection, acceptedResult.request.Args)
-	if remoteErr != nil && command.Process != nil {
-		_ = command.Process.Kill()
+	remoteErr := bridgeSSH(ctx, client, acceptedResult.connection, acceptedResult.request.Args, remotePath, peerHelper...)
+	var exitDeadline <-chan time.Time
+	if remoteErr != nil {
+		// bridgeSSH has closed the transport. A normal remote rejection (for
+		// example no installed rsync) lets the local rsync exit on EOF. Killing
+		// it immediately manufactures an unconfirmed signal exit and wrongly
+		// prevents SCP/stream fallback. A stuck child still takes the existing
+		// kill-and-wait path, whose uncertain-worker protection is unchanged.
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		exitDeadline = timer.C
 	}
 	var localErr error
 	select {
@@ -210,6 +247,8 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 	case <-ctx.Done():
 		localErr = killAndWait()
 		remoteErr = errors.Join(remoteErr, ctx.Err())
+	case <-exitDeadline:
+		localErr = killAndWait()
 	}
 	if remoteErr != nil || localErr != nil {
 		return fmt.Errorf("rsync failed: %w: %s", errors.Join(remoteErr, localErr), strings.TrimSpace(localError.String()))
@@ -217,12 +256,24 @@ func Run(ctx context.Context, client *ssh.Client, direction Direction, source, t
 	return nil
 }
 
-func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arguments []string) error {
+func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arguments []string, remotePath string, peerHelper ...string) error {
 	connection = activity.Conn(ctx, connection)
 	defer connection.Close()
 	commandArgs, err := rsyncServerArguments(arguments)
 	if err != nil {
 		return err
+	}
+	if !strings.HasPrefix(remotePath, "/") || strings.ContainsRune(remotePath, 0) {
+		return errors.New("rsync remote path must be absolute")
+	}
+	// rsync's rsh argv may already contain shell escapes. We have the exact
+	// single operand from the operation, so do not decode/requote those bytes
+	// or enable -s (which still expands remote glob patterns). Replace only
+	// that operand, then quote every SSH argv word exactly once. Standard
+	// rsync still owns server options, the protocol and receiver validation.
+	commandArgs[len(commandArgs)-1] = remotePath
+	if len(peerHelper) > 0 && peerHelper[0] != "" {
+		commandArgs = append([]string{peerHelper[0], "--transfer-server"}, commandArgs...)
 	}
 	session, err := client.NewSession()
 	if err != nil {
@@ -240,7 +291,7 @@ func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arg
 	var stderr boundedbuf.Buffer
 	session.Stderr = &stderr
 	if err := session.Start(joinShellWords(commandArgs)); err != nil {
-		return err
+		return &flytransfer.ExitUnconfirmedError{Cause: err}
 	}
 	var once sync.Once
 	cancel := func() { once.Do(func() { _ = session.Close(); _ = connection.Close() }) }
@@ -257,10 +308,17 @@ func bridgeSSH(ctx context.Context, client *ssh.Client, connection net.Conn, arg
 		_ = tcp.CloseWrite()
 	}
 	waitErr := session.Wait()
+	var exited *ssh.ExitError
+	confirmedExit := waitErr == nil
+	if waitErr != nil && (!errors.As(waitErr, &exited) || exited.Signal() != "") {
+		waitErr = &flytransfer.ExitUnconfirmedError{Cause: waitErr}
+	} else {
+		confirmedExit = true
+	}
 	cancel()
 	inputErr := <-inputDone
-	if waitErr == nil && outputErr == nil && (errors.Is(inputErr, net.ErrClosed) || errors.Is(inputErr, io.ErrClosedPipe)) {
-		inputErr = nil // Our shutdown unblocked an otherwise successful upload.
+	if confirmedExit && outputErr == nil && (errors.Is(inputErr, net.ErrClosed) || errors.Is(inputErr, io.ErrClosedPipe)) {
+		inputErr = nil // Our shutdown; keep any actual remote rejection below.
 	}
 	if waitErr != nil && stderr.Len() > 0 {
 		waitErr = fmt.Errorf("remote rsync: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
@@ -272,7 +330,7 @@ func rsyncServerArguments(arguments []string) ([]string, error) {
 	for index, argument := range arguments {
 		if argument == "rsync" {
 			result := append([]string(nil), arguments[index:]...)
-			if len(result) < 2 || !strings.HasPrefix(result[1], "--server") {
+			if len(result) < 5 || result[1] != "--server" || result[len(result)-2] != "." {
 				return nil, errors.New("refusing non-server rsync command")
 			}
 			return result, nil

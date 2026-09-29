@@ -28,6 +28,8 @@ export interface FileEntry {
 }
 
 export interface DirectoryListing {
+	warning?: string
+	connectionID?: number
   pane: PaneID
   endpoint: string
   path: string
@@ -55,6 +57,7 @@ export interface JobUpdate {
   state: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
   description: string
   message: string
+  output?: string
   progress: number
   progressKnown: boolean
   indeterminate: boolean
@@ -74,20 +77,51 @@ export interface HistoryEntry {
   operation: string
   success: boolean
   message: string
+  output?: string
+  method?: string
+  state?: JobUpdate['state']
   finishedAt: string
 }
 
 export interface ConfigTexts {
   markdown: string
+  revision?: string
+}
+
+export interface ConnectionRow {
+  id: string
+  name: string
+  disabled: boolean
+  relayAllowed: boolean
+  relayReady: boolean
+  lastRTT: number
+  lastSuccess: string
+}
+
+export interface RelayCache {
+  endpointAID: string
+  endpointBID: string
+  endpointA: string
+  endpointB: string
+  relay: string
+  lastSuccess: string
+}
+
+export interface ConnectionOverview {
+  revision: string
+  hosts: ConnectionRow[]
+  socks: ConnectionRow[]
+  relays: RelayCache[]
 }
 
 export interface Challenge {
   id: string
-  kind: 'confirm-host-key' | 'password'
+  kind: 'confirm-host-key' | 'password' | 'confirm'
   title: string
   message: string
   secret?: boolean
   allowSave?: boolean
+  allowSkip?: boolean
 }
 
 export interface TerminalData {

@@ -86,7 +86,7 @@ func Preflight(ctx context.Context, operation Operation) (PreflightReport, error
 	if err != nil {
 		return PreflightReport{}, fmt.Errorf("target identity: %w", err)
 	}
-	report.SameMachine = report.SourceIdentity.MachineID != "" && report.SourceIdentity.MachineID == report.TargetIdentity.MachineID
+	report.SameMachine = endpoint.SameMachine(report.SourceIdentity, report.TargetIdentity)
 	if target, statErr := operation.Destination.Stat(ctx, targetPath); statErr == nil {
 		report.TargetExists = true
 		if !operation.Overwrite {

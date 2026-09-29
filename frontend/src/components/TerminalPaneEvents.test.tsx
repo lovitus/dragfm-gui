@@ -1,4 +1,4 @@
-import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { TerminalCWD } from '../types'
 
@@ -13,13 +13,24 @@ vi.mock('../api', () => ({
 }))
 vi.mock('@xterm/xterm', () => ({ Terminal: class {
   rows = 24; cols = 80
-  loadAddon() {} open() {} focus() {} dispose() {}
+  loadAddon() {} open() {} focus() {} dispose() {} writeln() {}
   onData() { return { dispose() {} } }
 } }))
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit() {} } }))
 import TerminalPane from './TerminalPane'
 
-afterEach(() => { cleanup(); listeners.clear(); ready.mockClear(); changeDirectory.mockClear() })
+afterEach(() => { cleanup(); listeners.clear(); ready.mockClear(); changeDirectory.mockReset(); changeDirectory.mockResolvedValue(undefined) })
+
+it('shows a refused navigation outside the terminal instead of drawing over the live prompt', async () => {
+  const { rerender } = render(<TerminalPane pane="left" path="/old" active={false} onCWD={() => {}} />)
+  await waitFor(() => expect(ready).toHaveBeenCalled())
+  act(() => listeners.get('terminal:cwd')!({ pane: 'left', session: 'session', path: '/old' }))
+  changeDirectory.mockRejectedValueOnce(new Error('终端正在编辑输入或执行命令'))
+  rerender(<TerminalPane pane="left" path="/new" active={false} onCWD={() => {}} />)
+  const message = await screen.findByRole('status')
+  expect(message.textContent).toContain('终端正在编辑输入或执行命令')
+  expect(message.closest('.terminal-host')).toBeNull()
+})
 
 it('ignores delayed duplicate cwd prompts without losing genuine shell navigation or command refresh', async () => {
   const onCWD = vi.fn()

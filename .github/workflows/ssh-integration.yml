@@ -1,18 +1,40 @@
 name: real-ssh-integration
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # PR/main have one producer, called by build.yml. Keep the independent
+  # manual entry and reuse entry without running duplicate artifact producers.
+  workflow_dispatch:
   workflow_call:
 permissions:
   contents: read
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 concurrency:
   group: ssh-integration-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   ssh-integration:
+    name: ssh-${{ matrix.group }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    # The previous single 20m package budget expired after 28 root tests.
+    # Partition existing tests on isolated fixtures, retaining the same limits
+    # and expectations. Core is the complement, so new Hosted tests are included.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: protected
+            run: '^TestHosted(DualProtectedQueuedTransfer|ExplicitRootVaultKeyQueuedTransfer)$'
+            skip: ''
+          - group: transports
+            run: '^TestHosted(InitiatingUserPasswordlessQueuedTransfer|ReviewedTransportMatrix|ReviewedHansRolesAndMethods|ReviewedRouteFailureRecovery|ReviewedFailedRelayCacheReprobes)$'
+            skip: ''
+          - group: core
+            run: '^Test(Hosted.*|RemoteTransferMethodsOnHostedFixtures)$'
+            skip: '^TestHosted(DualProtectedQueuedTransfer|ExplicitRootVaultKeyQueuedTransfer|InitiatingUserPasswordlessQueuedTransfer|ReviewedTransportMatrix|ReviewedHansRolesAndMethods|ReviewedRouteFailureRecovery|ReviewedFailedRelayCacheReprobes)$'
+    env:
+      DRAGFM_E2E_RUN: ${{ matrix.run }}
+      DRAGFM_E2E_SKIP: ${{ matrix.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,11 +51,13 @@ jobs:
         run: ./build/build-linux-agents.sh
       - name: Real SSH transfers, queue, history, sudo, proxies and Hans
         run: ./build/ci/ssh-integration.sh
+      - name: Record successful completion of this exact SSH shard
+        run: python3 build/ci/record-evidence.py test-results --stage "ssh-${{ matrix.group }}" --file COMMIT.txt --file ssh-integration.jsonl
       - name: Preserve integration evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dragfm-gui-ssh-evidence
+          name: dragfm-gui-ssh-evidence-${{ matrix.group }}
           path: test-results/
           retention-days: 14
           if-no-files-found: error

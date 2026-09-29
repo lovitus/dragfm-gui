@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lovitus/dragfm-gui/internal/agentlease"
 	"github.com/lovitus/dragfm-gui/internal/agentproto"
 )
 
@@ -51,11 +52,13 @@ func (b *processOutput) text(secrets []string) string {
 }
 
 type processJob struct {
-	command *exec.Cmd
-	done    chan struct{}
-	err     error // Written before done closes; readers wait for that close.
-	output  *processOutput
-	secrets []string
+	command  *exec.Cmd
+	done     chan struct{}
+	err      error // Written before done closes; readers wait for that close.
+	output   *processOutput
+	secrets  []string
+	stopOnce sync.Once
+	stopErr  error
 }
 
 func (job *processJob) failure() error {
@@ -79,7 +82,13 @@ func (s *Service) startHans(request agentproto.Request) (string, error) {
 		if net.ParseIP(network).To4() == nil || lease == "" {
 			return "", errors.New("invalid Hans server network or lease path")
 		}
-		output, err := exec.CommandContext(s.ctx, binary, "--show-identity", "--identity-file", identity).Output()
+		identityCommand := exec.CommandContext(s.ctx, binary, "--show-identity", "--identity-file", identity)
+		configureChildLifecycle(identityCommand)
+		identityCommand.WaitDelay = 2 * time.Second
+		if err := agentlease.Attach(s.ctx, identityCommand); err != nil {
+			return "", err
+		}
+		output, err := identityCommand.Output()
 		if err != nil {
 			return "", fmt.Errorf("Hans identity generation: %w", err)
 		}
@@ -100,13 +109,18 @@ func (s *Service) startHans(request agentproto.Request) (string, error) {
 	}
 	command := exec.CommandContext(s.ctx, binary, args...)
 	configureChildLifecycle(command)
-	command.Cancel = func() error { return command.Process.Signal(os.Interrupt) }
+	command.Cancel = func() error { return signalChildGroup(command, os.Interrupt) }
 	command.WaitDelay = 2 * time.Second
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return "", err
 	}
 	command.ExtraFiles = []*os.File{reader}
+	if err := agentlease.Attach(s.ctx, command); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return "", err
+	}
 	job := &processJob{command: command, done: make(chan struct{}), output: &processOutput{}}
 	for _, secret := range request.Secret {
 		job.secrets = append(job.secrets, secret)
@@ -117,24 +131,20 @@ func (s *Service) startHans(request agentproto.Request) (string, error) {
 		writer.Close()
 		return "", err
 	}
+	go func() { job.err = command.Wait(); close(job.done) }()
 	reader.Close()
 	if _, err := io.WriteString(writer, passphrase+"\n"); err != nil {
 		writer.Close()
-		command.Process.Kill()
-		command.Wait()
-		return "", err
+		return "", errors.Join(err, job.stop())
 	}
 	writer.Close()
 	s.mu.Lock()
 	if _, exists := s.processes[jobID]; exists {
 		s.mu.Unlock()
-		command.Process.Kill()
-		command.Wait()
-		return "", errors.New("duplicate process job")
+		return "", errors.Join(errors.New("duplicate process job"), job.stop())
 	}
 	s.processes[jobID] = job
 	s.mu.Unlock()
-	go func() { job.err = command.Wait(); close(job.done) }()
 	select {
 	case <-job.done:
 		err := job.failure()
@@ -173,24 +183,43 @@ func (s *Service) processDiagnostics(jobID string) (string, error) {
 func (s *Service) stopProcess(jobID string) error {
 	s.mu.Lock()
 	job := s.processes[jobID]
-	delete(s.processes, jobID)
 	s.mu.Unlock()
 	if job == nil {
 		return nil
 	}
-	_ = job.command.Process.Signal(os.Interrupt)
-	select {
-	case <-job.done:
-	case <-time.After(2 * time.Second):
-		_ = job.command.Process.Kill()
-		<-job.done
+	err := job.stop()
+	if err == nil {
+		s.mu.Lock()
+		if s.processes[jobID] == job {
+			delete(s.processes, jobID)
+		}
+		s.mu.Unlock()
 	}
-	if job.err == nil || errors.Is(job.err, context.Canceled) {
-		return nil
-	}
-	var exit *exec.ExitError
-	if errors.As(job.err, &exit) {
-		return nil
-	} // Expected on explicit stop.
-	return job.err
+	return err
+}
+
+func (job *processJob) stop() error {
+	job.stopOnce.Do(func() {
+		select {
+		case <-job.done:
+		default:
+			_ = signalChildGroup(job.command, os.Interrupt)
+			select {
+			case <-job.done:
+			case <-time.After(2 * time.Second):
+				_ = signalChildGroup(job.command, os.Kill)
+				select {
+				case <-job.done:
+				case <-time.After(2 * time.Second):
+					job.stopErr = errors.New("Hans exit unconfirmed; installation retained")
+					return
+				}
+			}
+		}
+		var exit *exec.ExitError
+		if job.err != nil && !errors.Is(job.err, context.Canceled) && !errors.As(job.err, &exit) {
+			job.stopErr = job.err
+		}
+	})
+	return job.stopErr
 }

@@ -20,10 +20,15 @@ import (
 )
 
 type paneState struct {
+	id         PaneID
 	name       string
+	shell      string // Bound to this connection, never re-read by display name.
 	path       string
 	endpoint   endpoint.Endpoint
 	generation uint64
+	stale      bool
+	connection uint64
+	warning    string
 }
 
 type terminalSession struct {
@@ -44,8 +49,10 @@ type App struct {
 	vaultPath     string
 	queue         *jobs.Queue
 	lifecycleMu   sync.Mutex
+	recoveryMu    sync.Mutex
 	locking       bool
 	generation    uint64
+	configVersion uint64
 	sessionCtx    context.Context
 	sessionCancel context.CancelFunc
 	forwardDone   chan struct{}
@@ -216,7 +223,7 @@ func (a *App) Bootstrap() (BootstrapModel, error) {
 	}
 	history := make([]HistoryEntryModel, 0, len(a.document.History))
 	for _, item := range a.document.History {
-		history = append(history, HistoryEntryModel{ID: item.ID, Operation: a.redactKnownLocked(item.Operation), Success: item.Success, Message: a.redactKnownLocked(item.Message), FinishedAt: timestamp(item.FinishedAt)})
+		history = append(history, HistoryEntryModel{ID: item.ID, Operation: a.redactKnownLocked(item.Operation), Success: item.Success, Message: a.redactKnownLocked(item.Message), Method: a.redactKnownLocked(item.Method), State: item.State, Output: a.redactKnownLocked(item.Output), FinishedAt: timestamp(item.FinishedAt)})
 	}
 	return BootstrapModel{Unlocked: true, Hosts: hosts, LeftEndpoint: leftEndpoint, RightEndpoint: rightEndpoint, LeftPath: leftPath, RightPath: rightPath, Theme: theme, History: history}, nil
 }
@@ -377,7 +384,7 @@ func (a *App) jobModel(update jobs.Update) JobUpdateModel {
 }
 
 func (a *App) jobModelLocked(update jobs.Update) JobUpdateModel {
-	return JobUpdateModel{ID: update.ID, Revision: update.Revision, State: string(update.State), Description: a.redactKnownLocked(update.Description), Message: a.redactKnownLocked(update.Message), Progress: update.Progress, ProgressKnown: update.ProgressKnown, Indeterminate: update.Indeterminate, Stage: update.Stage, Method: update.Method, BytesDone: update.BytesDone, BytesTotal: update.BytesTotal, FilesDone: update.FilesDone, FilesTotal: update.FilesTotal, StartedAt: timestamp(update.StartedAt), FinishedAt: timestamp(update.FinishedAt)}
+	return JobUpdateModel{ID: update.ID, Revision: update.Revision, State: string(update.State), Description: a.redactKnownLocked(update.Description), Message: a.redactKnownLocked(update.Message), Output: a.redactKnownLocked(update.Output), Progress: update.Progress, ProgressKnown: update.ProgressKnown, Indeterminate: update.Indeterminate, Stage: a.redactKnownLocked(update.Stage), Method: a.redactKnownLocked(update.Method), BytesDone: update.BytesDone, BytesTotal: update.BytesTotal, FilesDone: update.FilesDone, FilesTotal: update.FilesTotal, StartedAt: timestamp(update.StartedAt), FinishedAt: timestamp(update.FinishedAt)}
 }
 
 func (a *App) recordHistory(queue *jobs.Queue, update jobs.Update) {
@@ -395,7 +402,7 @@ func (a *App) recordHistory(queue *jobs.Queue, update jobs.Update) {
 			return
 		}
 	}
-	a.document.History = append(a.document.History, appconfig.HistoryEntry{ID: update.ID, StartedAt: update.StartedAt, FinishedAt: update.FinishedAt, Operation: model.Description, Success: update.State == jobs.Succeeded, Message: model.Message})
+	a.document.History = append(a.document.History, appconfig.HistoryEntry{ID: update.ID, StartedAt: update.StartedAt, FinishedAt: update.FinishedAt, Operation: model.Description, Success: update.State == jobs.Succeeded, Message: model.Message, Method: model.Method, State: model.State, Output: historyOutput(model.Output)})
 	if len(a.document.History) > 500 {
 		a.document.History = append([]appconfig.HistoryEntry(nil), a.document.History[len(a.document.History)-500:]...)
 	}
@@ -438,12 +445,16 @@ func (a *App) pane(value PaneID) (*paneState, error) {
 	pane := a.panes[value]
 	if pane != nil {
 		copy := *pane
+		copy.id = value
 		copy.generation = a.generation
 		pane = &copy
 	}
 	a.mu.RUnlock()
 	if pane == nil || pane.endpoint == nil {
 		return nil, errors.New("文件栏尚未初始化")
+	}
+	if pane.stale {
+		return nil, errors.New("连接配置已改变，请刷新文件栏重新连接")
 	}
 	return pane, nil
 }
@@ -458,8 +469,8 @@ func contains(values []string, wanted string) bool {
 }
 
 var (
-	inlineCredentialPattern = regexp.MustCompile(`([[:alnum:]_.~%+-]+:)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s@]+)(@)`)
-	metadataSecretPattern   = regexp.MustCompile(`(?mi)^(###(?:sudo密码|root密码|口令)[ \t]*\r?\n)[^\r\n]+`)
+	inlineCredentialPattern = regexp.MustCompile(`([[:alnum:]_.~%+-]+:)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)(@)`)
+	metadataSecretPattern   = regexp.MustCompile(`(?mi)^(###(?:sudo密码|root密码|口令|待核对旧密码)[ \t]*\r?\n)[^\r\n]+`)
 	assignmentSecretPattern = regexp.MustCompile(`(?i)(\b(?:password|passwd|passphrase|sudo_password|root_password)\s*[:=]\s*)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;]+)`)
 	privateKeyPattern       = regexp.MustCompile(`(?s)-----BEGIN (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----.*?-----END (?:OPENSSH |RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----`)
 )

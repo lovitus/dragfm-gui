@@ -6,6 +6,16 @@ function maskedValues(source: string): string[] {
 }
 
 describe('Markdown credential masking', () => {
+  it.each(['p%40ss', 'p@ss', 'p:#@ss'])('masks the whole literal SOCKS password %s', (password) => {
+    const source = '#socks池\n##pool\nuser:' + password + '@192.0.2.1:1080'
+    expect(maskedValues(source)).toEqual([password])
+  })
+
+  it('masks inert legacy credentials including escaped quotes and newlines', () => {
+    const recovery = JSON.stringify(['legacy@password', 'escaped"password\nvalue'])
+    const source = '#主机\n##host\nu@192.0.2.1:22\n###待核对旧密码\n' + recovery + '\n#私钥\n#socks池'
+    expect(maskedValues(source)).toEqual([recovery])
+  })
   it('masks inline SSH/SOCKS passwords and optional password fields', () => {
     const source = `#主机
 ##host

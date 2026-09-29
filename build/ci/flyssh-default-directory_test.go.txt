@@ -1,0 +1,129 @@
+package transfer
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/flyssh/flyssh/internal/testkit"
+	"github.com/flyssh/flyssh/pkg/cli"
+)
+
+// Keep umask out of the parent Go test process. The child uses the same test
+// binary and public CLI→Spec→Run path, real loopback SSH and system SCP.
+func TestSCPDownloadDefaultDirectoryPermissions(t *testing.T) {
+	if os.Getenv("DRAGFM_DEFAULT_SCP_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+		defer cancel()
+		child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSCPDownloadDefaultDirectoryPermissions$", "-test.v", "-test.timeout=45s")
+		child.Env = append(os.Environ(), "DRAGFM_DEFAULT_SCP_CHILD=1")
+		output, err := child.CombinedOutput()
+		t.Logf("isolated default SCP contract:\n%s", output)
+		if err != nil {
+			t.Fatal("isolated default SCP contract failed: ", err)
+		}
+		return
+	}
+	if os.Geteuid() == 0 {
+		t.Fatal("default SCP permission fixture requires the unprivileged hosted account")
+	}
+	previous := syscall.Umask(0o027)
+	defer syscall.Umask(previous)
+	server := testkit.StartSSHServer(t, map[string]string{"u1": "p1"})
+	client := dialTransferSSH(t, server.Addr, "u1", "p1")
+	defer client.Close()
+	for _, existing := range []bool{false, true} {
+		name := "new"
+		if existing {
+			name = "existing"
+		}
+		t.Run(name, func(t *testing.T) {
+			source := filepath.Join(t.TempDir(), "readonly-source")
+			if err := os.Mkdir(source, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("default non-preserving SCP payload\n")
+			leaf := filepath.Join(source, "leaf.txt")
+			if err := os.WriteFile(leaf, payload, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(leaf, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(source, 0o555); err != nil {
+				t.Fatal(err)
+			}
+			parent := t.TempDir()
+			target := filepath.Join(parent, filepath.Base(source))
+			t.Cleanup(func() {
+				for _, directory := range []string{source, target} {
+					if err := os.Chmod(directory, 0o700); err != nil && !errors.Is(err, fs.ErrNotExist) {
+						t.Error("fixture permission cleanup: ", err)
+					}
+				}
+			})
+			wantedMode := fs.FileMode(0o550) // source 0555, actual caller umask 0027
+			if existing {
+				if err := os.Mkdir(target, 0o770); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(target, 0o770); err != nil {
+					t.Fatal(err)
+				}
+				wantedMode = 0o770 // no -p must retain the existing directory mode
+			}
+			probe, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			readable, readErr := probe.Output("cat -- " + shellEscape(leaf))
+			_ = probe.Close()
+			if readErr != nil || !bytes.Equal(readable, payload) {
+				t.Fatal("real SSH source-read prerequisite failed: ", readErr)
+			}
+			spec, err := FromOptions(&cli.Options{ScpDownload: "-r -- " + shellEscape(source) + " " + shellEscape(parent)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, err := Run(client, spec)
+			if err != nil || code != 0 {
+				info, statErr := os.Stat(target)
+				_, leafErr := os.Stat(filepath.Join(target, "leaf.txt"))
+				if !existing && errors.Is(err, fs.ErrPermission) && statErr == nil && info.Mode().Perm() == 0o550 && errors.Is(leafErr, fs.ErrNotExist) {
+					t.Fatal("DEFAULT_SCP_NEW_PERMISSION_FAILURE: actual source was readable, newly received directory denied creation: ", err)
+				}
+				t.Fatalf("default SCP failed before the designated permission boundary: code=%d err=%v", code, err)
+			}
+			contents, err := os.ReadFile(filepath.Join(target, "leaf.txt"))
+			if err != nil || !bytes.Equal(contents, payload) {
+				t.Fatal("default SCP did not copy the actual payload: ", err)
+			}
+			info, err := os.Stat(target)
+			if err != nil || info.Mode().Perm() != wantedMode {
+				t.Fatalf("default SCP directory permissions: mode=%v want=%v err=%v", info, wantedMode, err)
+			}
+			fileInfo, err := os.Stat(filepath.Join(target, "leaf.txt"))
+			if err != nil {
+				t.Fatal("default SCP file stat failed: ", err)
+			}
+			if fileInfo.Mode().Perm() != 0o640 {
+				if fileInfo.Mode().Perm() == 0o644 {
+					t.Fatalf("DEFAULT_SCP_FILE_UMASK_FAILURE_%s: content and directory mode were correct, but source 0644 broadened the caller 0640 file mode", name)
+				}
+				t.Fatalf("default SCP file mode failed before the designated umask boundary: mode=%v want=0640", fileInfo.Mode().Perm())
+			}
+			if existing {
+				t.Log("DEFAULT_SCP_EXISTING_OK: content copied and original directory permissions retained")
+			} else {
+				t.Log("DEFAULT_SCP_NEW_OK: readonly source copied and caller umask retained")
+			}
+		})
+	}
+}

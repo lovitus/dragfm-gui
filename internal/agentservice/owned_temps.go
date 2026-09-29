@@ -1,6 +1,7 @@
 package agentservice
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lovitus/dragfm-gui/internal/agentlease"
 )
 
 type ownershipMarker struct {
@@ -61,15 +64,15 @@ func validatedTemp(root *os.Root, name string) (*os.Root, ownershipMarker, error
 	actual, statErr := file.Stat()
 	data, readErr := io.ReadAll(io.LimitReader(file, 4097))
 	_ = file.Close()
-	if statErr != nil || !os.SameFile(owner, actual) || readErr != nil || len(data) > 4096 || json.Unmarshal(data, &marker) != nil || marker.Version != 1 || marker.Nonce == "" || name != ".dragfm-"+marker.Nonce || marker.Created.IsZero() || marker.Created.After(time.Now().Add(time.Minute)) {
+	if statErr != nil || !os.SameFile(owner, actual) || readErr != nil || len(data) > 4096 || json.Unmarshal(data, &marker) != nil || (marker.Version != 1 && marker.Version != 2) || marker.Nonce == "" || name != ".dragfm-"+marker.Nonce || marker.Created.IsZero() || marker.Created.After(time.Now().Add(time.Minute)) {
 		return fail(errors.New("temporary ownership marker does not match"))
 	}
 	return child, marker, nil
 }
 
-func removeOwnedTemp(path string) error {
+func removeOwnedTemp(ctx context.Context, path string) error {
 	path = filepath.Clean(path)
-	if filepath.Dir(path) != "/tmp" {
+	if filepath.Dir(path) != "/tmp" || path != selfDirectory() {
 		return errors.New("refusing to remove unscoped temporary path")
 	}
 	root, err := os.OpenRoot("/tmp")
@@ -81,34 +84,51 @@ func removeOwnedTemp(path string) error {
 	if err != nil {
 		return err
 	}
-	_ = child.Close()
+	defer child.Close()
+	opened, err := child.Stat(".")
+	if err != nil {
+		return err
+	}
+	current, err := root.Lstat(filepath.Base(path))
+	if err != nil || !os.SameFile(opened, current) || !agentlease.Matches(ctx, opened) {
+		return errors.New("helper installation changed before removal")
+	}
 	return root.RemoveAll(filepath.Base(path))
 }
 
-// Mark the running helper, then clean its private installation after all child
-// processes and staging paths are stopped. A stale cleaner never removes an
-// active helper merely because a transfer has lasted more than 24 hours.
-func OwnInstallation() func() {
+// All modes, including independent --sftp channels, acquire a lease BEFORE
+// handling input. The returned release never deletes files: Serve must first
+// prove quiescence. Inherited child descriptors survive a helper crash.
+func OwnInstallation(ctx context.Context) (context.Context, func() error, error) {
 	dir := selfDirectory()
 	if dir == "" {
-		return func() {}
+		return ctx, func() error { return nil }, nil
 	}
 	root, err := os.OpenRoot("/tmp")
 	if err != nil {
-		return func() {}
+		return ctx, nil, err
 	}
 	defer root.Close()
 	child, _, err := validatedTemp(root, filepath.Base(dir))
 	if err != nil {
-		return func() {}
+		return ctx, nil, err
+	}
+	ctx, lease, err := agentlease.Acquire(ctx, child)
+	if err != nil {
+		return ctx, nil, err
+	}
+	original, statErr := child.Stat(".")
+	current, pathErr := root.Lstat(filepath.Base(dir))
+	if statErr != nil || pathErr != nil || !os.SameFile(original, current) {
+		_ = lease.Close()
+		return ctx, nil, errors.New("helper installation changed while acquiring lease")
 	}
 	file, err := child.OpenFile(".dragfm-agent-pid", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err == nil {
 		_, _ = file.WriteString(strconv.Itoa(os.Getpid()))
 		_ = file.Close()
 	}
-	_ = child.Close()
-	return func() { _ = removeOwnedTemp(dir) }
+	return ctx, lease.Close, nil
 }
 
 func cleanupOwnedTemps(directory, keep string, olderThan time.Duration) error {
@@ -129,32 +149,47 @@ func cleanupOwnedTemps(directory, keep string, olderThan time.Duration) error {
 		expected, _ = os.Stat(directory)
 	}
 	now := time.Now()
+	var failures []error
 	for _, entry := range entries {
 		candidate := filepath.Join(directory, entry.Name())
 		if !entry.IsDir() || candidate == filepath.Clean(keep) || !strings.HasPrefix(entry.Name(), ".dragfm-") {
 			continue
 		}
 		info, err := root.Lstat(entry.Name())
-		if err != nil || !sameOwner(expected, info) {
+		if err != nil || (!sameOwner(expected, info) && !effectiveOwner(info)) {
 			continue
 		}
 		child, marker, err := validatedTemp(root, entry.Name())
 		if err != nil {
 			continue
 		}
-		active := false
-		if file, err := child.Open(".dragfm-agent-pid"); err == nil {
-			data, _ := io.ReadAll(io.LimitReader(file, 32))
-			_ = file.Close()
-			if pid, err := strconv.Atoi(string(data)); err == nil && pid > 0 {
-				exe, _ := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
-				active = filepath.Dir(exe) == candidate
+		if now.Sub(marker.Created) < olderThan {
+			_ = child.Close()
+			continue
+		}
+		if marker.Version == 2 {
+			// The process type is irrelevant: system pipelines inherit this
+			// directory lease too. Never turn unsupported flock into permission
+			// to delete. Keep the descriptor locked until removal is complete.
+			lock, lockErr := lockStaleDirectory(child)
+			if lockErr == nil {
+				current, statErr := root.Lstat(entry.Name())
+				if statErr == nil && os.SameFile(info, current) {
+					if err := root.RemoveAll(entry.Name()); err != nil {
+						failures = append(failures, err)
+					}
+				}
+				_ = lock.Close()
+			} else if !errors.Is(lockErr, errDirectoryLeased) {
+				failures = append(failures, lockErr)
 			}
+			_ = child.Close()
+			continue
 		}
+		// A v1 helper PID being absent/reused does not prove that its Hans,
+		// rsync or independent SFTP processes exited. It has no lease contract;
+		// keep it, even when its PID is conclusively dead.
 		_ = child.Close()
-		if !active && now.Sub(marker.Created) >= olderThan {
-			_ = root.RemoveAll(entry.Name())
-		}
 	}
-	return nil
+	return errors.Join(failures...)
 }

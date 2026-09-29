@@ -1,0 +1,6 @@
+diff --git a/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go b/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go
+--- a/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go
++++ b/vendor/github.com/flyssh/flyssh/pkg/transfer/scp.go
+@@ -477 +477 @@
+-			if err := os.MkdirAll(target, mode|0700); err != nil {
++			if err := os.MkdirAll(target, mode); err != nil {

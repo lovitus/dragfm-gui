@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"strings"
@@ -15,19 +16,33 @@ import (
 // for every comparison. Missing IDs (e.g. BSD/macOS) mean cross-machine safety,
 // not a fabricated match or a command that can wait indefinitely.
 func (r *Remote) Identity(ctx context.Context) (Identity, error) {
+	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	result := Identity{Kind: SSHKind, Name: r.name, Fingerprint: r.fingerprint}
-	if r.sftp == nil {
-		identity, err := r.identityViaCommand(ctx)
-		if !validMachineID(identity.MachineID) {
-			identity.MachineID = ""
-		}
-		return identity, err
+	if r.client != nil {
+		result.Principal = r.client.User()
 	}
-	id, err := readMachineID(ctx, r.Open)
-	result.MachineID = id
-	return result, err
+	var err error
+	if r.sftp == nil {
+		var identity Identity
+		identity, err = r.identityViaCommand(ctx)
+		if validMachineID(identity.MachineID) {
+			result.MachineID = strings.ToLower(identity.MachineID)
+		}
+	} else {
+		result.MachineID, err = readMachineID(ctx, r.Open)
+	}
+	if err != nil || result.MachineID == "" {
+		return result, err
+	}
+	// Use the effective file channel's root, including privileged views.
+	// A restricted account unable to provide this evidence still browses and
+	// transfers through its streams; it cannot opt into native cp/mv.
+	if device, inode, probeErr := r.FileVersion(ctx, "/"); probeErr == nil {
+		result.RootView = fmt.Sprintf("%d:%d", device, inode)
+	}
+	return result, caller.Err()
 }
 
 func validMachineID(value string) bool {
