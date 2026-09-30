@@ -24,6 +24,7 @@ func TestStalledSFTPRequestIsCancelled(t *testing.T) {
 		t.Fatal(err)
 	}
 	var pause atomic.Bool
+	blocked := make(chan struct{})
 	stop := make(chan struct{})
 	var workers sync.WaitGroup
 	workers.Add(1)
@@ -49,12 +50,10 @@ func TestStalledSFTPRequestIsCancelled(t *testing.T) {
 			if readErr != nil {
 				return
 			}
-			for pause.Load() {
-				select {
-				case <-stop:
-					return
-				case <-time.After(5 * time.Millisecond):
-				}
+			if pause.Load() {
+				close(blocked)
+				<-stop
+				return
 			}
 			if _, err := server.Write(buffer[:n]); err != nil {
 				return
@@ -68,11 +67,23 @@ func TestStalledSFTPRequestIsCancelled(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer remote.Close()
+	directory := t.TempDir()
 	pause.Store(true)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := remote.List(ctx, t.TempDir()); done <- err }()
+	go func() { _, err := remote.List(ctx, directory); done <- err }()
+	// A timer starting before TempDir/scheduling can expire before any I/O:
+	// idle cancellation correctly leaves the connection open. Observe the
+	// actual blocked request before cancelling, without proxy polling.
+	select {
+	case <-blocked:
+		cancel()
+	case err := <-done:
+		t.Fatalf("fixture did not block the SFTP request: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("fixture did not observe an in-flight request")
+	}
 	select {
 	case err := <-done:
 		if err == nil || ctx.Err() == nil || !remote.IsClosed() {

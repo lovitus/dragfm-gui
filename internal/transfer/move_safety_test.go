@@ -22,6 +22,18 @@ func (e namedEndpoint) Identity(context.Context) (endpoint.Identity, error) {
 	return endpoint.Identity{MachineID: e.name}, nil
 }
 
+func (e namedEndpoint) SyncPaths(ctx context.Context, paths []string) error {
+	return e.Endpoint.(interface {
+		SyncPaths(context.Context, []string) error
+	}).SyncPaths(ctx, paths)
+}
+
+func (e namedEndpoint) FileVersion(ctx context.Context, path string) (uint64, uint64, error) {
+	return e.Endpoint.(interface {
+		FileVersion(context.Context, string) (uint64, uint64, error)
+	}).FileVersion(ctx, path)
+}
+
 type mutatingTarget struct {
 	namedEndpoint
 	onRead func()

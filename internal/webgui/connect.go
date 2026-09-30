@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/flyssh/flyssh/pkg/connector"
@@ -16,9 +17,26 @@ import (
 )
 
 type routeCandidate struct {
-	route   connector.Route
-	relayID string
-	cached  bool
+	route          connector.Route
+	relayID        string
+	cached         bool
+	owners         []hopOwner
+	temporaryProxy bool // One-off SOCKS test must not qualify a different saved route as a relay.
+}
+
+// A composed route's hop number is not a credential identity. Prefix hops
+// belong to the relay configuration, never to the target's password slots.
+type hopOwner struct {
+	host config.Host
+	hop  int
+}
+
+func routeOwners(host config.Host, count int) []hopOwner {
+	owners := make([]hopOwner, count)
+	for index := range owners {
+		owners[index] = hopOwner{host: host, hop: index}
+	}
+	return owners
 }
 
 func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName string) (*paneState, error) {
@@ -34,8 +52,9 @@ func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName 
 		name = "本机"
 	}
 	a.mu.RLock()
+	configVersion := a.configVersion
 	current := a.panes[paneID]
-	if current != nil && current.endpoint != nil && current.name == name && endpointOpen(current.endpoint) {
+	if current != nil && !current.stale && current.endpoint != nil && current.name == name && endpointOpen(current.endpoint) {
 		copy := *current
 		copy.generation = generation
 		a.mu.RUnlock()
@@ -73,44 +92,85 @@ func (a *App) ensureEndpoint(ctx context.Context, paneID PaneID, name, peerName 
 	}
 	state := &paneState{name: name, path: directory, endpoint: next, generation: generation}
 	a.mu.Lock()
-	if a.store == nil || a.locking || generation != a.generation {
+	if a.store == nil || a.locking || generation != a.generation || configVersion != a.configVersion {
 		a.mu.Unlock()
 		_ = next.Close()
 		return nil, context.Canceled
 	}
 	previous := a.panes[paneID]
+	if host, ok := a.document.HostByName(name); ok {
+		state.shell = host.Shell
+	}
+	a.sequence++
+	state.connection = a.sequence
 	a.panes[paneID] = state
 	if previous != nil && previous.endpoint != nil {
 		a.retired = append(a.retired, previous.endpoint)
 	}
+	snapshot := *state
 	a.mu.Unlock()
-	return state, nil
+	if err := a.enqueueWorkspaceRecovery(&snapshot); err != nil {
+		a.mu.Lock()
+		snapshot.warning = "遗留工作区未能加入清理队列，目录仍保留：" + a.redactKnownLocked(err.Error())
+		if a.panes[paneID] == state {
+			state.warning = snapshot.warning
+		}
+		a.mu.Unlock()
+	}
+	return &snapshot, nil
 }
 
 func (a *App) connectRemote(ctx context.Context, name, peerName string) (*endpoint.Remote, string, error) {
+	return a.connectRemoteVia(ctx, name, peerName, false, nil)
+}
+
+// Explicit tests use exactly the selected saved route (and optional selected
+// SOCKS). Failure must not silently dial unrelated relay candidates.
+func (a *App) connectRemoteVia(ctx context.Context, name, peerName string, exact bool, proxy *connector.SOCKS5) (*endpoint.Remote, string, error) {
 	a.mu.RLock()
 	document := a.document.Clone()
+	generation, configVersion := a.generation, a.configVersion
+	if exact {
+		if settings, ok := ctx.Value(jobSettingsKey{}).(*jobSettings); ok {
+			document, generation, configVersion = settings.document, settings.generation, settings.version
+		}
+	}
 	host, ok := document.HostByName(name)
 	a.mu.RUnlock()
 	if !ok || host.Disabled {
 		return nil, "", fmt.Errorf("未找到可用主机 %q", name)
 	}
-	candidates, err := a.routeCandidates(host, peerName)
+	var candidates []routeCandidate
+	var err error
+	if exact {
+		var route connector.Route
+		route, err = a.routeForHostContext(ctx, host)
+		if proxy != nil {
+			route.SOCKS = proxy
+		}
+		candidates = []routeCandidate{{route: route, owners: routeOwners(host, len(route.Hops)), temporaryProxy: proxy != nil}}
+	} else {
+		candidates, err = a.routeCandidates(host, peerName)
+	}
 	if err != nil {
 		return nil, "", err
 	}
 	var failures []error
 	for _, candidate := range candidates {
 		route := candidate.route
-		for retry := 0; retry <= len(route.Hops); retry++ {
+		answers := make(map[int]challengeAnswer)
+		for retry := 0; retry < max(3, len(route.Hops)*2+1); retry++ {
+			a.mu.RLock()
+			stale := a.locking || a.generation != generation || a.configVersion != configVersion
+			a.mu.RUnlock()
+			if stale {
+				return nil, "", errors.New("连接期间配置或会话已改变，请重新连接")
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
 			remote, dialErr := endpoint.DialSSH(ctx, host.Name, host.HostFingerprint, route)
 			if dialErr == nil {
-				a.mu.Lock()
-				a.sessionSSH[host.ID] = true
-				a.mu.Unlock()
-				if candidate.relayID != "" {
-					a.rememberRelay(host.ID, peerName, candidate.relayID)
-				}
 				directory := host.LastDirectory
 				if directory == "" {
 					directory, dialErr = remote.Home(ctx)
@@ -119,41 +179,30 @@ func (a *App) connectRemote(ctx context.Context, name, peerName string) (*endpoi
 					_ = remote.Close()
 					return nil, "", dialErr
 				}
+				if err := a.acceptConnectionCredentials(host.ID, candidate, answers, generation, configVersion); err != nil {
+					_ = remote.Close()
+					return nil, "", err
+				}
+				if candidate.relayID != "" {
+					a.rememberRelay(host.ID, peerName, candidate.relayID)
+				}
 				return remote, directory, nil
 			}
 			failures = append(failures, dialErr)
-			if !isAuthenticationError(dialErr) {
+			if !isAuthenticationError(dialErr) || retry+1 == max(3, len(route.Hops)*2+1) {
 				break
 			}
 			hopIndex := authenticationHop(dialErr)
-			if hopIndex < 0 || hopIndex >= len(route.Hops) {
+			if hopIndex < 0 || hopIndex >= len(route.Hops) || hopIndex >= len(candidate.owners) {
 				break
 			}
-			answer, accepted := a.ask(ctx, ChallengeModel{Kind: "password", Title: fmt.Sprintf("SSH 认证 · %s · 第 %d 跳", name, hopIndex+1), Message: "现有私钥、SSH Agent 和已保存密码均未通过。输入本次连接密码后重试。", Secret: true, AllowSave: true})
+			owner := candidate.owners[hopIndex]
+			answer, accepted := a.ask(ctx, ChallengeModel{Kind: "password", Title: fmt.Sprintf("SSH 认证 · %s · 第 %d 跳", owner.host.Name, owner.hop+1), Message: "现有私钥、SSH Agent 和密码未通过。输入本次连接密码重试；仅在连接成功后缓存，勾选保存才写入该会话的配置。", Secret: true, AllowSave: true})
 			if !accepted || answer.Value == "" {
-				break
+				return nil, "", errors.New("已取消 SSH 认证")
 			}
 			route.Hops[hopIndex].Credentials.Password = answer.Value
-			a.mu.Lock()
-			if a.runtimePasswords[host.ID] == nil {
-				a.runtimePasswords[host.ID] = make(map[int]string)
-			}
-			a.runtimePasswords[host.ID][hopIndex] = answer.Value
-			if answer.Save {
-				for index := range a.document.Hosts {
-					if a.document.Hosts[index].ID == host.ID {
-						for len(a.document.Hosts[index].HopPasswords) <= hopIndex {
-							a.document.Hosts[index].HopPasswords = append(a.document.Hosts[index].HopPasswords, "")
-						}
-						a.document.Hosts[index].HopPasswords[hopIndex] = answer.Value
-						break
-					}
-				}
-			}
-			a.mu.Unlock()
-			if answer.Save {
-				_ = a.save()
-			}
+			answers[hopIndex] = answer
 		}
 		if candidate.cached {
 			a.forgetRelay(host.ID, peerName)
@@ -167,7 +216,7 @@ func (a *App) routeCandidates(host config.Host, peerName string) ([]routeCandida
 	if err != nil {
 		return nil, err
 	}
-	result := []routeCandidate{{route: base}}
+	result := []routeCandidate{{route: base, owners: routeOwners(host, len(base.Hops))}}
 	a.mu.RLock()
 	cachedRelay := a.cachedRelayLocked(host.ID, peerName)
 	var relayIDs []string
@@ -186,7 +235,7 @@ func (a *App) routeCandidates(host config.Host, peerName string) ([]routeCandida
 	// is reserved for a transfer after direct methods fail.
 	for _, relayID := range relayIDs {
 		relay := document.HostByID(relayID)
-		if relay == nil || relay.Disabled {
+		if relay == nil || relay.Disabled || relay.NoRelay {
 			continue
 		}
 		relayRoute, routeErr := a.routeForHost(*relay)
@@ -196,19 +245,59 @@ func (a *App) routeCandidates(host config.Host, peerName string) ([]routeCandida
 		candidate := connector.Route{Timeout: base.Timeout, SOCKS: relayRoute.SOCKS}
 		candidate.Hops = append(candidate.Hops, relayRoute.Hops...)
 		candidate.Hops = append(candidate.Hops, base.Hops...)
-		result = append(result, routeCandidate{route: candidate, relayID: relayID, cached: relayID == cachedRelay})
+		owners := append(routeOwners(*relay, len(relayRoute.Hops)), routeOwners(host, len(base.Hops))...)
+		result = append(result, routeCandidate{route: candidate, relayID: relayID, cached: relayID == cachedRelay, owners: owners})
 	}
 	return result, nil
 }
 
 func (a *App) routeForHost(host config.Host) (connector.Route, error) {
-	a.mu.RLock()
-	document := a.document.Clone()
-	runtimePasswords := make(map[int]string)
-	for index, value := range a.runtimePasswords[host.ID] {
-		runtimePasswords[index] = value
+	return a.routeForHostContext(context.Background(), host)
+}
+
+// A controller's route describes how to reach an endpoint from this machine,
+// not from another remote. A peer uses the final authenticated account/key;
+// only an explicitly selected transfer pool adds preceding hops.
+func (a *App) peerTransferRoute(ctx context.Context, host config.Host, socks *connector.SOCKS5, prefix []connector.Hop) (connector.Route, error) {
+	route, err := a.routeForHostContext(ctx, host)
+	if err != nil {
+		return connector.Route{}, err
 	}
-	a.mu.RUnlock()
+	if len(route.Hops) == 0 {
+		return connector.Route{}, errors.New("传输对端 SSH 路由为空")
+	}
+	final := route.Hops[len(route.Hops)-1]
+	route.Hops = append(append([]connector.Hop(nil), prefix...), final)
+	route.SOCKS = socks
+	return route, nil
+}
+
+func (a *App) routeForHostContext(ctx context.Context, host config.Host) (connector.Route, error) {
+	settings := a.settingsFor(ctx)
+	document := settings.document
+	generation, version := settings.generation, settings.version
+	runtimePasswords := settings.passwords[host.ID]
+	confirmFingerprint := func(hop int, address, fingerprint string) bool {
+		title := fmt.Sprintf("端点：%s\n第 %d 跳：%s", host.Name, hop+1, address)
+		if hop < 0 {
+			title = fmt.Sprintf("主机：%s", address)
+		}
+		_, accepted := a.ask(ctx, ChallengeModel{Kind: "confirm-host-key", Title: "首次连接 SSH 跳点", Message: title + "\n指纹：" + fingerprint + "\n\n确认固定该指纹并继续？"})
+		if !accepted {
+			return false
+		}
+		if err := a.storeFingerprint(host, hop, fingerprint, generation, version); err != nil {
+			// The connector callback can return only bool. Surface the original
+			// persistence/conflict error here instead of disguising it as a
+			// network or password failure in the later handshake error.
+			a.mu.RLock()
+			message := a.redactKnownLocked(err.Error())
+			a.mu.RUnlock()
+			a.ask(ctx, ChallengeModel{Kind: "confirm-host-key", Title: "SSH 指纹未保存，连接已中止", Message: message})
+			return false
+		}
+		return true
+	}
 	if host.RouteSpec != "" {
 		hops, err := routespec.ParseSSH(host.RouteSpec, func(name string) (*config.PrivateKey, bool) {
 			for index := range document.Keys {
@@ -227,8 +316,6 @@ func (a *App) routeForHost(host config.Host) (connector.Route, error) {
 				// configured password. connector.authMethods still tries SSH Agent
 				// and vault private keys before this password.
 				hops[index].Credentials.Password = runtimePasswords[index]
-			} else if hops[index].Credentials.Password == "" && index < len(host.HopPasswords) {
-				hops[index].Credentials.Password = host.HopPasswords[index]
 			}
 			fingerprint := ""
 			if index < len(host.HopFingerprints) {
@@ -239,12 +326,19 @@ func (a *App) routeForHost(host config.Host) (connector.Route, error) {
 				continue
 			}
 			hopIndex := index
+			var confirmMu sync.Mutex
+			confirmed := ""
 			hops[index].HostKey = connector.HostKeyPolicy{ConfirmNew: func(address, fingerprint string) bool {
-				_, accepted := a.ask(context.Background(), ChallengeModel{Kind: "confirm-host-key", Title: "首次连接 SSH 跳点", Message: fmt.Sprintf("端点：%s\n第 %d 跳：%s\n指纹：%s\n\n确认固定该指纹并继续？", host.Name, hopIndex+1, address, fingerprint)})
-				if accepted {
-					a.storeHopFingerprint(host.ID, hopIndex, fingerprint)
+				confirmMu.Lock()
+				defer confirmMu.Unlock()
+				if confirmed != "" {
+					return confirmed == fingerprint
 				}
-				return accepted
+				if !confirmFingerprint(hopIndex, address, fingerprint) {
+					return false
+				}
+				confirmed = fingerprint
+				return true
 			}}
 		}
 		route := connector.Route{Hops: hops, Timeout: 15 * time.Second}
@@ -262,6 +356,9 @@ func (a *App) routeForHost(host config.Host) (connector.Route, error) {
 		return route, nil
 	}
 	credentials := connector.Credentials{UseAgent: true, Password: host.Password}
+	if runtimePasswords[0] != "" {
+		credentials.Password = runtimePasswords[0]
+	}
 	for _, keyID := range host.KeyIDs {
 		key := document.KeyByID(keyID)
 		if key == nil {
@@ -272,11 +369,7 @@ func (a *App) routeForHost(host config.Host) (connector.Route, error) {
 	policy := connector.HostKeyPolicy{PinnedSHA256: host.HostFingerprint}
 	if host.HostFingerprint == "" {
 		policy.ConfirmNew = func(address, fingerprint string) bool {
-			_, accepted := a.ask(context.Background(), ChallengeModel{Kind: "confirm-host-key", Title: "首次连接主机", Message: fmt.Sprintf("主机：%s\n指纹：%s\n\n确认固定该指纹并继续？", address, fingerprint)})
-			if accepted {
-				a.storeHostFingerprint(host.ID, fingerprint)
-			}
-			return accepted
+			return confirmFingerprint(-1, address, fingerprint)
 		}
 	}
 	port := host.Port
@@ -304,6 +397,11 @@ func (a *App) ask(ctx context.Context, challenge ChallengeModel) (challengeAnswe
 	defer timer.Stop()
 	select {
 	case answer := <-response:
+		if challenge.Secret {
+			if settings, ok := ctx.Value(jobSettingsKey{}).(*jobSettings); ok {
+				settings.addSecret(answer.Value)
+			}
+		}
 		return answer, answer.Accepted
 	case <-ctx.Done():
 		a.dropChallenge(challenge.ID)
@@ -324,37 +422,20 @@ func (a *App) ResolveChallenge(id string, accepted bool, value string, save bool
 	}
 }
 
+func (a *App) SkipChallenge(id string) {
+	a.mu.Lock()
+	response := a.challenges[id]
+	delete(a.challenges, id)
+	a.mu.Unlock()
+	if response != nil {
+		response <- challengeAnswer{Skipped: true}
+	}
+}
+
 func (a *App) dropChallenge(id string) {
 	a.mu.Lock()
 	delete(a.challenges, id)
 	a.mu.Unlock()
-}
-
-func (a *App) storeHopFingerprint(hostID string, hop int, fingerprint string) {
-	a.mu.Lock()
-	for index := range a.document.Hosts {
-		if a.document.Hosts[index].ID == hostID {
-			for len(a.document.Hosts[index].HopFingerprints) <= hop {
-				a.document.Hosts[index].HopFingerprints = append(a.document.Hosts[index].HopFingerprints, "")
-			}
-			a.document.Hosts[index].HopFingerprints[hop] = fingerprint
-			break
-		}
-	}
-	a.mu.Unlock()
-	_ = a.save()
-}
-
-func (a *App) storeHostFingerprint(hostID, fingerprint string) {
-	a.mu.Lock()
-	for index := range a.document.Hosts {
-		if a.document.Hosts[index].ID == hostID {
-			a.document.Hosts[index].HostFingerprint = fingerprint
-			break
-		}
-	}
-	a.mu.Unlock()
-	_ = a.save()
 }
 
 func endpointID(document config.Document, name string) string {
@@ -375,8 +456,12 @@ func orderedPair(left, right string) (string, string) {
 }
 
 func (a *App) cachedRelayLocked(targetID, peerName string) string {
-	left, right := orderedPair(targetID, endpointID(a.document, peerName))
-	for _, item := range a.document.Relays {
+	return cachedRelay(a.document, targetID, peerName)
+}
+
+func cachedRelay(document config.Document, targetID, peerName string) string {
+	left, right := orderedPair(targetID, endpointID(document, peerName))
+	for _, item := range document.Relays {
 		if item.EndpointAID == left && item.EndpointBID == right {
 			return item.RelayHostID
 		}
@@ -385,7 +470,19 @@ func (a *App) cachedRelayLocked(targetID, peerName string) string {
 }
 
 func (a *App) rememberRelay(targetID, peerName, relayID string) {
+	a.rememberRelayContext(context.Background(), targetID, peerName, relayID)
+}
+
+func (a *App) rememberRelayContext(ctx context.Context, targetID, peerName, relayID string) {
 	a.mu.Lock()
+	if !a.settingsCurrentLocked(ctx) {
+		a.mu.Unlock()
+		return
+	}
+	if host := a.document.HostByID(relayID); host != nil && host.NoRelay {
+		a.mu.Unlock()
+		return
+	}
 	left, right := orderedPair(targetID, endpointID(a.document, peerName))
 	found := false
 	for index := range a.document.Relays {
@@ -403,7 +500,15 @@ func (a *App) rememberRelay(targetID, peerName, relayID string) {
 }
 
 func (a *App) forgetRelay(targetID, peerName string) {
+	a.forgetRelayContext(context.Background(), targetID, peerName)
+}
+
+func (a *App) forgetRelayContext(ctx context.Context, targetID, peerName string) {
 	a.mu.Lock()
+	if !a.settingsCurrentLocked(ctx) {
+		a.mu.Unlock()
+		return
+	}
 	left, right := orderedPair(targetID, endpointID(a.document, peerName))
 	for index := range a.document.Relays {
 		if a.document.Relays[index].EndpointAID == left && a.document.Relays[index].EndpointBID == right {

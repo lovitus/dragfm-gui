@@ -2,11 +2,14 @@ package configtext
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/lovitus/dragfm-gui/internal/config"
+	"github.com/lovitus/dragfm-gui/internal/routespec"
 )
 
 // Markdown is the single, user-facing configuration format. It intentionally
@@ -21,6 +24,11 @@ func Markdown(document config.Document) string {
 			spec += "," + host.Shell
 		}
 		lines = append(lines, spec)
+		if len(host.UnverifiedPasswords) > 0 {
+			// One physical line, including passwords with quotes or newlines.
+			encoded, _ := json.Marshal(host.UnverifiedPasswords)
+			lines = append(lines, "###待核对旧密码", string(encoded))
+		}
 		if host.SudoPassword != "" {
 			lines = append(lines, "###sudo密码", host.SudoPassword)
 		}
@@ -29,6 +37,16 @@ func Markdown(document config.Document) string {
 		}
 		if host.RootPassword != "" {
 			lines = append(lines, "###root密码", host.RootPassword)
+		}
+		if len(host.RootKeyIDs) > 0 {
+			lines = append(lines, "###root私钥")
+			for _, id := range host.RootKeyIDs {
+				name := id
+				if key := document.KeyByID(id); key != nil {
+					name = key.Name
+				}
+				lines = append(lines, name)
+			}
 		}
 		if host.DefaultSOCKSID != "" {
 			name := host.DefaultSOCKSID
@@ -39,6 +57,9 @@ func Markdown(document config.Document) string {
 		}
 		if host.Disabled {
 			lines = append(lines, "###禁用", "true")
+		}
+		if host.NoRelay {
+			lines = append(lines, "###允许跳板", "false")
 		}
 	}
 	lines = append(lines, "#私钥")
@@ -75,6 +96,33 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 	var hosts []config.Host
 	var keys []config.PrivateKey
 	var proxies []config.SOCKSProxy
+	rootKeyNames := make(map[string][]string)
+	// IDs are identity, not physical line numbers. Reserve every old ID before
+	// reading new entries so inserting above an existing entry cannot alias it.
+	reserved := make(map[string]int)
+	for _, host := range old.Hosts {
+		reserved[host.ID]++
+	}
+	for _, key := range old.Keys {
+		reserved[key.ID]++
+	}
+	for _, proxy := range old.SOCKS {
+		reserved[proxy.ID]++
+	}
+	used := make(map[string]bool)
+	identity := func(kind, previous string) string {
+		if previous != "" && reserved[previous] == 1 && !used[previous] {
+			used[previous] = true
+			return previous
+		}
+		for {
+			id := kind + "-" + rand.Text()
+			if reserved[id] == 0 && !used[id] {
+				used[id] = true
+				return id
+			}
+		}
+	}
 	section := sectionNone
 	sectionSeen := map[markdownSection]int{}
 	seenNames := map[markdownSection]map[string]int{
@@ -110,21 +158,26 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 			if len(primary) != 1 {
 				return fmt.Errorf("第 %d 行：主机 %q 的 FlySSH 路由必须独占一行", pending.line, pending.name)
 			}
-			if err := requireMetadata(metadata, "sudo密码", "root用户", "root密码", "默认socks", "禁用"); err != nil {
+			if err := requireMetadata(metadata, "sudo密码", "root用户", "root密码", "root私钥", "默认socks", "禁用", "允许跳板", "待核对旧密码"); err != nil {
 				return fmt.Errorf("第 %d 行：主机 %q: %w", pending.line, pending.name, err)
 			}
 			spec, shell := splitHostShell(strings.TrimSpace(primary[0]))
 			if spec == "" {
 				return fmt.Errorf("第 %d 行：主机 %q 的 FlySSH 路由为空", pending.line, pending.name)
 			}
-			host := config.Host{ID: fmt.Sprintf("host-line-%d", pending.line), Name: pending.name, RouteSpec: spec, Shell: shell}
+			host := config.Host{Name: pending.name, RouteSpec: spec, Shell: shell}
 			if existing, ok := old.HostByName(pending.name); ok {
 				host.ID = existing.ID
-				host.SudoPassword, host.RootUser, host.RootPassword = existing.SudoPassword, existing.RootUser, existing.RootPassword
-				host.LastDirectory, host.Disabled = existing.LastDirectory, existing.Disabled
 				if existing.RouteSpec == spec {
-					host.HopFingerprints = append([]string(nil), existing.HopFingerprints...)
-					host.HopPasswords = append([]string(nil), existing.HopPasswords...)
+					host.LastDirectory = existing.LastDirectory
+				}
+				trusted := min(routespec.MatchingHostPrefix(existing.RouteSpec, spec), len(existing.HopFingerprints))
+				host.HopFingerprints = append([]string(nil), existing.HopFingerprints[:trusted]...)
+			}
+			host.ID = identity("host", host.ID)
+			if value, ok := metadataValue(metadata, "待核对旧密码"); ok {
+				if err := json.Unmarshal([]byte(value), &host.UnverifiedPasswords); err != nil {
+					return fmt.Errorf("第 %d 行：待核对旧密码应为 JSON 字符串数组；该字段不会用于认证", pending.line)
 				}
 			}
 			if value, ok := metadataValue(metadata, "sudo密码"); ok {
@@ -136,6 +189,9 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 			if value, ok := metadataValue(metadata, "root密码"); ok {
 				host.RootPassword = value
 			}
+			if names, ok := metadata["root私钥"]; ok {
+				rootKeyNames[host.ID] = names
+			}
 			if value, ok := metadataValue(metadata, "默认socks"); ok {
 				// SaveConfigTexts resolves this user-facing name to a stable ID.
 				host.DefaultSOCKSID = value
@@ -145,6 +201,13 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 				if err != nil {
 					return fmt.Errorf("第 %d 行：主机 %q 的禁用状态: %w", pending.line, pending.name, err)
 				}
+			}
+			if value, ok := metadataValue(metadata, "允许跳板"); ok {
+				allowed, parseErr := parseMarkdownBool(value)
+				if parseErr != nil {
+					return fmt.Errorf("第 %d 行：主机 %q 的允许跳板状态: %w", pending.line, pending.name, parseErr)
+				}
+				host.NoRelay = !allowed
 			}
 			hosts = append(hosts, host)
 		case sectionKeys:
@@ -162,13 +225,17 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 			if pem == "" {
 				return fmt.Errorf("第 %d 行：私钥 %q 的正文为空", pending.line, pending.name)
 			}
-			key := config.PrivateKey{ID: fmt.Sprintf("key-line-%d", pending.line), Name: pending.name, PEM: pem + "\n"}
+			key := config.PrivateKey{Name: pending.name, PEM: pem + "\n"}
 			for _, existing := range old.Keys {
 				if existing.Name == pending.name {
-					key.ID, key.Passphrase, key.Fingerprint = existing.ID, existing.Passphrase, existing.Fingerprint
+					key.ID = existing.ID
+					if existing.PEM == key.PEM {
+						key.Fingerprint = existing.Fingerprint
+					}
 					break
 				}
 			}
+			key.ID = identity("key", key.ID)
 			if value, ok := metadataValue(metadata, "口令"); ok {
 				key.Passphrase = value
 			}
@@ -181,13 +248,17 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 				return fmt.Errorf("第 %d 行：SOCKS %q 必须独占一行", pending.line, pending.name)
 			}
 			spec := strings.TrimSpace(primary[0])
-			proxy := config.SOCKSProxy{ID: fmt.Sprintf("socks-line-%d", pending.line), Name: pending.name, Spec: spec}
+			proxy := config.SOCKSProxy{Name: pending.name, Spec: spec}
 			for _, existing := range old.SOCKS {
 				if existing.Name == pending.name {
-					proxy.ID, proxy.LastRTT, proxy.LastSuccess, proxy.Disabled = existing.ID, existing.LastRTT, existing.LastSuccess, existing.Disabled
+					proxy.ID = existing.ID
+					if existing.Spec == spec {
+						proxy.LastRTT, proxy.LastSuccess = existing.LastRTT, existing.LastSuccess
+					}
 					break
 				}
 			}
+			proxy.ID = identity("socks", proxy.ID)
 			if value, ok := metadataValue(metadata, "禁用"); ok {
 				proxy.Disabled, err = parseMarkdownBool(value)
 				if err != nil {
@@ -263,6 +334,28 @@ func ParseMarkdown(text string, old config.Document) ([]config.Host, []config.Pr
 	} {
 		if sectionSeen[required] == 0 {
 			return nil, nil, nil, fmt.Errorf("缺少必需分区 %s", title)
+		}
+	}
+	// Key declarations can appear after hosts. Resolve only against this edit,
+	// never a deleted key from the previous vault. One physical line is one name,
+	// so spaces/commas in a vault key name do not become credential separators.
+	keyIDs := make(map[string]string, len(keys))
+	for _, key := range keys {
+		keyIDs[key.Name] = key.ID
+	}
+	for i := range hosts {
+		seen := make(map[string]bool)
+		for _, value := range rootKeyNames[hosts[i].ID] {
+			name := strings.TrimSpace(value)
+			id, ok := keyIDs[name]
+			if !ok {
+				return nil, nil, nil, fmt.Errorf("第 %d 行：主机 %q 的 root 私钥 %q 不存在，请在 #私钥 中定义同名条目", seenNames[sectionHosts][hosts[i].Name], hosts[i].Name, name)
+			}
+			if seen[id] {
+				return nil, nil, nil, fmt.Errorf("第 %d 行：主机 %q 的 root 私钥 %q 重复", seenNames[sectionHosts][hosts[i].Name], hosts[i].Name, name)
+			}
+			seen[id] = true
+			hosts[i].RootKeyIDs = append(hosts[i].RootKeyIDs, id)
 		}
 	}
 	return hosts, keys, proxies, nil
@@ -401,6 +494,7 @@ func ParseSSHRoutes(text string, old config.Document) ([]config.Host, error) {
 				host.ID, host.Name = existing.ID, existing.Name
 				host.Shell, host.SudoPassword = existing.Shell, existing.SudoPassword
 				host.RootUser, host.RootPassword = existing.RootUser, existing.RootPassword
+				host.RootKeyIDs = append([]string(nil), existing.RootKeyIDs...)
 				host.LastDirectory = existing.LastDirectory
 				if existing.RouteSpec == raw {
 					host.HopFingerprints = append([]string(nil), existing.HopFingerprints...)
@@ -540,6 +634,7 @@ func ParseConnections(text string, old config.Document) ([]config.Host, []config
 				host.SudoPassword = existing.SudoPassword
 				host.RootUser = existing.RootUser
 				host.RootPassword = existing.RootPassword
+				host.RootKeyIDs = append([]string(nil), existing.RootKeyIDs...)
 				host.LastDirectory = existing.LastDirectory
 				if existing.RouteSpec == spec {
 					host.HopFingerprints = append([]string(nil), existing.HopFingerprints...)

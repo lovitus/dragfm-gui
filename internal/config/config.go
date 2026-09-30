@@ -2,17 +2,18 @@ package config
 
 import "time"
 
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 type Document struct {
-	Version int            `json:"version"`
-	Hosts   []Host         `json:"hosts,omitempty"`
-	Keys    []PrivateKey   `json:"keys,omitempty"`
-	SOCKS   []SOCKSProxy   `json:"socks,omitempty"`
-	Jumps   []JumpRoute    `json:"jumps,omitempty"`
-	Relays  []RelaySuccess `json:"relay_success,omitempty"`
-	History []HistoryEntry `json:"history,omitempty"`
-	UI      UIState        `json:"ui"`
+	Version    int               `json:"version"`
+	Hosts      []Host            `json:"hosts,omitempty"`
+	Keys       []PrivateKey      `json:"keys,omitempty"`
+	SOCKS      []SOCKSProxy      `json:"socks,omitempty"`
+	Jumps      []JumpRoute       `json:"jumps,omitempty"`
+	Relays     []RelaySuccess    `json:"relay_success,omitempty"`
+	History    []HistoryEntry    `json:"history,omitempty"`
+	Workspaces []WorkspaceRecord `json:"workspaces,omitempty"`
+	UI         UIState           `json:"ui"`
 }
 
 type Host struct {
@@ -24,6 +25,7 @@ type Host struct {
 	Password        string   `json:"password,omitempty"`
 	RootUser        string   `json:"root_user,omitempty"`
 	RootPassword    string   `json:"root_password,omitempty"`
+	RootKeyIDs      []string `json:"root_key_ids,omitempty"` // Explicit vault keys for the final high-privilege account.
 	SudoPassword    string   `json:"sudo_password,omitempty"`
 	KeyIDs          []string `json:"key_ids,omitempty"`
 	HostFingerprint string   `json:"host_fingerprint,omitempty"`
@@ -32,9 +34,13 @@ type Host struct {
 	DefaultSOCKSID  string   `json:"default_socks_id,omitempty"`
 	DefaultJumpID   string   `json:"default_jump_id,omitempty"`
 	Disabled        bool     `json:"disabled,omitempty"`
+	NoRelay         bool     `json:"no_relay,omitempty"` // Keep usable as an endpoint, never an automatic relay.
 	RouteSpec       string   `json:"route_spec,omitempty"`
 	HopFingerprints []string `json:"hop_fingerprints,omitempty"`
 	HopPasswords    []string `json:"hop_passwords,omitempty"`
+	// V1 overlays did not identify the original owner of a composed-route hop.
+	// Retain them for manual recovery only; never use them for authentication.
+	UnverifiedPasswords []string `json:"unverified_passwords,omitempty"`
 }
 
 type PrivateKey struct {
@@ -85,6 +91,35 @@ type HistoryEntry struct {
 	Method      string    `json:"method"`
 	Success     bool      `json:"success"`
 	Message     string    `json:"message,omitempty"`
+	State       string    `json:"state,omitempty"`
+	Output      string    `json:"output,omitempty"`
+}
+
+// Recovery journal lives only inside the encrypted vault. This is ownership
+// metadata, never a resumable Pending job or a second copy of credentials.
+// An empty DirectoryID is a write-ahead intent: mkdir/marker creation may not
+// have completed. Deletion still requires the exact private ownership marker.
+type WorkspaceRecord struct {
+	HostID       string          `json:"host_id"`
+	Fingerprint  string          `json:"fingerprint"`
+	MachineID    string          `json:"machine_id,omitempty"`
+	Elevated     bool            `json:"elevated,omitempty"`
+	Path         string          `json:"path"`
+	ParentID     string          `json:"parent_id"`
+	DirectoryID  string          `json:"directory_id,omitempty"`
+	OwnerUID     uint32          `json:"owner_uid"`
+	MarkerSHA256 string          `json:"marker_sha256"`
+	CreatedAt    time.Time       `json:"created_at"`
+	Partials     []PartialRecord `json:"partials,omitempty"`
+}
+
+// Partial ownership is tied to the installation's writer lease. FileID is
+// empty until an actual inode has been observed; such an intent alone never
+// authorizes recovery to remove an existing file.
+type PartialRecord struct {
+	Path     string `json:"path"`
+	ParentID string `json:"parent_id"`
+	FileID   string `json:"file_id,omitempty"`
 }
 
 type UIState struct {
@@ -142,7 +177,9 @@ func (d Document) Clone() Document {
 	d.Hosts = append([]Host(nil), d.Hosts...)
 	for i := range d.Hosts {
 		d.Hosts[i].KeyIDs = append([]string(nil), d.Hosts[i].KeyIDs...)
+		d.Hosts[i].RootKeyIDs = append([]string(nil), d.Hosts[i].RootKeyIDs...)
 		d.Hosts[i].HopPasswords = append([]string(nil), d.Hosts[i].HopPasswords...)
+		d.Hosts[i].UnverifiedPasswords = append([]string(nil), d.Hosts[i].UnverifiedPasswords...)
 		d.Hosts[i].HopFingerprints = append([]string(nil), d.Hosts[i].HopFingerprints...)
 	}
 	d.Keys = append([]PrivateKey(nil), d.Keys...)
@@ -153,5 +190,9 @@ func (d Document) Clone() Document {
 	}
 	d.Relays = append([]RelaySuccess(nil), d.Relays...)
 	d.History = append([]HistoryEntry(nil), d.History...)
+	d.Workspaces = append([]WorkspaceRecord(nil), d.Workspaces...)
+	for i := range d.Workspaces {
+		d.Workspaces[i].Partials = append([]PartialRecord(nil), d.Workspaces[i].Partials...)
+	}
 	return d
 }

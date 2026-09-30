@@ -25,8 +25,10 @@ func TestParseFlySSHVaultKeys(t *testing.T) {
 	}
 }
 
-func TestParseSOCKSInline(t *testing.T) {
-	proxy, err := ParseSOCKS("user:p%40ss@127.0.0.1:1080")
+func TestParseSOCKSExplicitURLRetainsLegacyEscapes(t *testing.T) {
+	// V1 vault migration adds this explicit scheme. New shorthand is literal,
+	// but existing URL-escaped credentials must keep their original bytes.
+	proxy, err := ParseSOCKS("socks5://user:p%40ss@127.0.0.1:1080")
 	if err != nil {
 		t.Fatal(err)
 	}

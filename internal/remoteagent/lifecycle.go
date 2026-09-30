@@ -3,7 +3,8 @@ package remoteagent
 import (
 	"context"
 	"errors"
-	"io/fs"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,11 +56,12 @@ func (s *Session) abortTransport() {
 		select {
 		case <-closed:
 		case <-time.After(300 * time.Millisecond):
-			// A peer that does not consume channel writes can block channel Close too.
-			// Closing the owning transport unblocks those writes; browsing reconnects.
-			if s.remote != nil {
-				_ = s.remote.Close()
-			}
+		}
+		// Even a successful CHANNEL_CLOSE write can leave local readers
+		// waiting for a peer reply. This is the task's private transport;
+		// the browser/PTY has a separate connection and is not closed here.
+		if s.remote != nil {
+			_ = s.remote.Close()
 		}
 	})
 }
@@ -72,8 +74,16 @@ func (s *Session) Close() error {
 		if s.done != nil {
 			close(s.done)
 		}
+		s.filesMu.Lock()
+		fileErr := s.filesErr
+		for _, files := range s.files {
+			fileErr = errors.Join(fileErr, files.Close())
+		}
+		s.files = nil
+		s.sudoPassword = ""
+		s.filesMu.Unlock()
 		var cleanupErr error
-		if s.elevated {
+		if fileErr == nil {
 			// Install cancellation before waiting on the protocol mutex. A blocked
 			// transfer must not make privileged cleanup (and Lock) wait forever.
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -81,19 +91,16 @@ func (s *Session) Close() error {
 			cancel()
 		}
 		s.abortTransport()
-		var stdinErr, removeErr error
 		if s.stdin != nil {
-			stdinErr = s.stdin.Close()
+			_ = s.stdin.Close() // Already closed by transport; not exit evidence.
 		}
-		if s.remote != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			removeErr = s.remote.Remove(ctx, s.Directory, true)
-			if errors.Is(removeErr, fs.ErrNotExist) {
-				removeErr = nil
-			}
-			cancel()
+		if err := errors.Join(fileErr, cleanupErr); err != nil {
+			s.closeErr = fmt.Errorf("helper cleanup unconfirmed; installation retained for safe recovery: %w", err)
+		} else if s.journal != nil {
+			// A failed vault write keeps the record, even though the directory
+			// is gone. Reconnection can confirm absence and retire it safely.
+			s.closeErr = s.journal(s.installation, true)
 		}
-		s.closeErr = errors.Join(cleanupErr, stdinErr, removeErr)
 	})
 	return s.closeErr
 }
@@ -101,13 +108,20 @@ func (s *Session) Close() error {
 // SSH may write stderr concurrently with an early protocol/handshake failure.
 // Keep a bounded tail, with synchronized String, instead of an unguarded Buffer.
 type helperOutput struct {
-	mu   sync.Mutex
-	tail []byte
+	mu      sync.Mutex
+	tail    []byte
+	changed chan struct{}
 }
 
 func (b *helperOutput) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	defer func() {
+		if b.changed != nil {
+			close(b.changed)
+			b.changed = nil
+		}
+	}()
 	const limit = 16 << 10
 	n := len(data)
 	if n >= limit {
@@ -121,3 +135,23 @@ func (b *helperOutput) Write(data []byte) (int, error) {
 	return n, nil
 }
 func (b *helperOutput) String() string { b.mu.Lock(); defer b.mu.Unlock(); return string(b.tail) }
+
+func (b *helperOutput) waitFor(ctx context.Context, marker string) error {
+	for {
+		b.mu.Lock()
+		if strings.Contains(string(b.tail), marker) {
+			b.mu.Unlock()
+			return nil
+		}
+		if b.changed == nil {
+			b.changed = make(chan struct{})
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}

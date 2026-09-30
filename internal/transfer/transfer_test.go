@@ -141,6 +141,12 @@ type cancellingEndpoint struct {
 	cancel context.CancelFunc
 }
 
+func (e cancellingEndpoint) FileVersion(ctx context.Context, path string) (uint64, uint64, error) {
+	return e.Endpoint.(interface {
+		FileVersion(context.Context, string) (uint64, uint64, error)
+	}).FileVersion(ctx, path)
+}
+
 func (e cancellingEndpoint) Open(ctx context.Context, target string) (io.ReadCloser, error) {
 	reader, err := e.Endpoint.Open(ctx, target)
 	if err != nil {

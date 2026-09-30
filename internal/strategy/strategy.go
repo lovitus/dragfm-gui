@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -37,12 +38,14 @@ const (
 )
 
 type Attempt struct {
+	Group     bool // Pool/tunnel orchestration; not a concrete copy method.
 	Tier      Tier
 	RouteName string
 	Direction Direction
 	Elevated  bool
 	Method    Method
 	Risk      Risk
+	Risks     []Risk
 	Run       func(context.Context) error
 }
 
@@ -68,8 +71,78 @@ type Event struct {
 
 type Approval func(context.Context, Risk, Attempt) error
 
+type observerKey struct{}
+
+// Observe exposes the concrete method inside a pool/tunnel through the same
+// job observer as Execute. It does not change retry or approval decisions.
+func Observe(ctx context.Context, attempt Attempt, run func(context.Context) error) error {
+	observer, _ := ctx.Value(observerKey{}).(func(Event))
+	started := time.Now()
+	if observer != nil {
+		observer(Event{Attempt: attempt, Stage: "running", Started: started})
+	}
+	err := run(ctx)
+	if observer != nil {
+		stage := "succeeded"
+		if err != nil {
+			stage = "failed"
+		}
+		observer(Event{Attempt: attempt, Stage: stage, Error: err, Started: started, Elapsed: time.Since(started)})
+	}
+	return err
+}
+
+var ErrRiskSkipped = errors.New("已跳过本任务中需要这类权限的方法")
+
+type approvalKey struct{}
+type approvals struct {
+	mu        sync.Mutex
+	decisions map[Risk]error
+	ask       Approval
+}
+
+// Share decisions with nested SOCKS/jump/Hans attempts. Approving a listener
+// never implies sudo, and declining one class must not cancel unrelated routes.
+func WithApproval(ctx context.Context, approve Approval) context.Context {
+	return context.WithValue(ctx, approvalKey{}, &approvals{decisions: make(map[Risk]error), ask: approve})
+}
+
+func Authorize(ctx context.Context, attempt Attempt, risks ...Risk) error {
+	state, ok := ctx.Value(approvalKey{}).(*approvals)
+	for _, risk := range risks {
+		if risk == "" || risk == Ordinary {
+			continue
+		}
+		if !ok {
+			return fmt.Errorf("%s requires task approval: %w", risk, ErrRiskSkipped)
+		}
+		state.mu.Lock()
+		decision, known := state.decisions[risk]
+		if !known {
+			if state.ask == nil {
+				decision = fmt.Errorf("%s requires approval: %w", risk, ErrRiskSkipped)
+			} else {
+				decision = state.ask(ctx, risk, attempt)
+			}
+			if decision == nil || errors.Is(decision, ErrRiskSkipped) {
+				state.decisions[risk] = decision
+			}
+		}
+		state.mu.Unlock()
+		if decision != nil {
+			return decision
+		}
+	}
+	return nil
+}
+
 func Execute(ctx context.Context, attempts []Attempt, approve Approval, emit func(Event)) error {
-	approved := make(map[Risk]bool)
+	if emit != nil {
+		ctx = context.WithValue(ctx, observerKey{}, emit)
+	}
+	if _, ok := ctx.Value(approvalKey{}).(*approvals); !ok {
+		ctx = WithApproval(ctx, approve)
+	}
 	var failures []error
 	for _, attempt := range attempts {
 		if err := ctx.Err(); err != nil {
@@ -78,24 +151,17 @@ func Execute(ctx context.Context, attempts []Attempt, approve Approval, emit fun
 		if attempt.Run == nil {
 			continue
 		}
-		if attempt.Risk != "" && attempt.Risk != Ordinary && !approved[attempt.Risk] {
-			if approve == nil {
-				failures = append(failures, fmt.Errorf("%s requires approval", attempt.Risk))
+		if err := Authorize(ctx, attempt, append([]Risk{attempt.Risk}, attempt.Risks...)...); err != nil {
+			if emit != nil {
+				emit(Event{Attempt: attempt, Stage: "skipped", Error: err})
+			}
+			if errors.Is(err, ErrRiskSkipped) {
+				failures = append(failures, err)
 				continue
 			}
-			if err := approve(ctx, attempt.Risk, attempt); err != nil {
-				return err
-			}
-			approved[attempt.Risk] = true
+			return err
 		}
-		started := time.Now()
-		if emit != nil {
-			emit(Event{Attempt: attempt, Stage: "running", Started: started})
-		}
-		err := attempt.Run(ctx)
-		if emit != nil {
-			emit(Event{Attempt: attempt, Stage: map[bool]string{true: "failed", false: "succeeded"}[err != nil], Error: err, Started: started, Elapsed: time.Since(started)})
-		}
+		err := Observe(ctx, attempt, attempt.Run)
 		if err == nil {
 			return nil
 		}

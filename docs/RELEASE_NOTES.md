@@ -1,6 +1,8 @@
-# dragfm-gui — public six-platform release candidate
+# dragfm-gui — validation candidate
 
 This distribution is the Wails + React desktop application in `cmd/dragfm-wails`, not the retained Fyne prototype. It does not replace the original dragfm TUI.
+
+The current delivery priority is **macOS arm64 only**. Other platforms remain supported by the retained build/release workflows, but are not automatically built or published before the user validates the Mac version. Read `PROVENANCE.json`: `macos-arm64-candidate` contains only the Mac archive; `six-platform-release-candidate` is the separate, explicitly requested full-platform path. A candidate artifact is not a public release or acceptance of all requirements.
 
 ## Choose the matching package
 
@@ -29,9 +31,13 @@ The encrypted Markdown configuration supports FlySSH multihop routes, vault-resi
 
 Linux remote transfers try the documented direction/privilege matrix with rsync, SCP, authenticated encrypted streams and ncat carriers. SOCKS, SSH relay and official Hans v1.7.0 replay all four methods without putting proxy credentials into ncat arguments. Hans is pinned v5, uses an elevated server and a userspace SOCKS client, and supports reversed roles. Final controller relaying uses bounded memory rather than staging file contents locally. Cross-machine moves verify manifests and source identity before deleting the source; detected changes keep the source.
 
-## Release evidence
+## Candidate and release evidence
 
-Publication is conditional on all of these passing for the exact release revision:
+The Mac-only candidate consumes the same event checkout's exact source archive, completed frontend/Go/race/vet producer, all three real-SSH shards and full Mac-native suite, including ordinary no-argument vault startup. Each producer records its commit, tree, candidate head, run/attempt and exact file hashes. Packaging does not rebuild or re-sign the application. An independent Mac runner checks the full manifest, fixes the hash of the exact verified manifest bytes as a workflow output, extracts the actual archive, verifies architecture/permissions/signature, and runs the original native acceptance on that executable. The final step must still match that fixed manifest, its complete asset set and every asset's bytes before emitting a separate `PACKAGED_ACCEPTANCE.json` receipt. Missing extraction output, removed entries/assets or a self-consistently rewritten manifest are failures; the final step does not regenerate checksums or repack the application archive.
+
+`TEST_EVIDENCE.zip` includes only named completion summaries and source-bound hashes. Raw logs, terminal/config contents and arbitrary evidence files are not copied into the distribution. The archive is initially marked unpublished and awaiting extracted-package verification. A successful separate receipt proves only the technical scope it names, not user approval of terminal presentation or the entire requirements ledger.
+
+The retained six-platform publication path, when explicitly authorized, remains conditional on all of these passing for the exact release revision:
 
 * Go unit/race tests, vet, frontend tests and production compilation, and no reported npm vulnerabilities.
 * Real Linux OpenSSH integration: 48 direction/privilege/method combinations across direct/SOCKS/SSH relay, eight official-Hans role/method combinations, scoped sudo, real blocked-network fallback, relay-cache invalidation, cancellation latency and cleanup.
@@ -39,7 +45,7 @@ Publication is conditional on all of these passing for the exact release revisio
 * The larger macOS arm64 real-SSH native suite: simultaneous Running/Pending, configuration editing/masking, file operations, SSH PTYs, sudo downloads into protected local directories, declined-sudo source preservation, process restart and changed-host-key rejection.
 * Extraction and native execution of every packaged binary on a second set of hosted runners, followed by download/checksum verification of every uploaded release asset before the draft is published.
 
-`PROVENANCE.json` records the commit, source hash, per-platform executable hashes and workflow run. `TEST_EVIDENCE.zip` contains first-run reports. `PACKAGED_TEST_EVIDENCE.zip` contains extracted-package reports. `SHA256SUMS` covers all distribution assets. A source branch containing this file is not itself proof that publication succeeded; the published release and its evidence are the result.
+`PROVENANCE.json` records the commit/tree, candidate head, source hash, selected-platform executable hashes and workflow run/attempt. `TEST_EVIDENCE.zip` contains bounded first-run summaries. The full release path also supplies `PACKAGED_TEST_EVIDENCE.zip`; the Mac-only validation path supplies its separate acceptance receipt instead. `SHA256SUMS` covers all distribution assets. A source branch containing this file is not itself proof that packaging, acceptance or publication succeeded.
 
 ## Operational boundaries
 

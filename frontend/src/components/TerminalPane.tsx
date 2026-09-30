@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { api, onEvent } from '../api'
@@ -14,6 +14,8 @@ function decodeBase64(value: string): Uint8Array {
 export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure }: { pane: PaneID; path: string; active: boolean; onCWD: (path: string) => void; onSyncFailure?: () => void }) {
   const host = useRef<HTMLDivElement>(null)
   const sessionRef = useRef('')
+  const shellReady = useRef(false)
+  const [error, setError] = useState('')
   const reportErrorRef = useRef<(reason: unknown) => void>(() => {})
   const initialPath = useRef(path)
   const displayedPath = useRef(path)
@@ -51,7 +53,9 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
         brightMagenta: '#d2a8ff', brightCyan: '#a5f3fc', brightWhite: '#f0f6fc',
       },
     })
-    const reportError = (reason: unknown) => { if (!disposed) terminal.writeln(`\r\n\x1b[31m${String(reason)}\x1b[0m`) }
+    // UI errors are not PTY output. Writing them into xterm changes the
+    // cursor behind readline/ZLE's back, leaving fragments on the next edit.
+    const reportError = (reason: unknown) => { if (!disposed) setError(String(reason)) }
     reportErrorRef.current = reportError
     const fit = new FitAddon()
     terminal.loadAddon(fit)
@@ -73,8 +77,19 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
           if (event.sequence <= cwdSequence) return
           cwdSequence = event.sequence
         }
+        const firstPrompt = shellPath === undefined
         const unchanged = shellPath === event.path
         shellPath = event.path
+        shellReady.current = true
+        if (firstPrompt && initialPath.current !== path) {
+          // Navigation during slow login waits for the actual first prompt;
+          // it must never become input to a program started by a profile.
+          void api.terminalChangeDirectory(session, initialPath.current).catch((reason) => {
+            onSyncFailureRef.current?.()
+            reportError(reason)
+          })
+          return
+        }
         // A delayed duplicate prompt from the previous directory is not a
         // shell navigation. It must not undo a newer file-pane navigation
         // while the PTY is acknowledging the requested cd.
@@ -84,7 +99,12 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
         onCWDRef.current(event.path)
       }
     })
-    const input = terminal.onData((data) => { if (session) void api.terminalInput(session, data).catch(reportError) })
+    const input = terminal.onData((data) => {
+      if (session) {
+        setError('')
+        void api.terminalInput(session, data).catch(reportError)
+      }
+    })
     const startFrame = requestAnimationFrame(() => {
       if (disposed) return
       fit.fit()
@@ -95,7 +115,6 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
           sessionRef.current = id
           await api.terminalReady(id)
           if (disposed) return
-          if (initialPath.current !== path) await api.terminalChangeDirectory(id, initialPath.current)
           if (activeRef.current) terminal.focus()
         }
       }).catch(reportError)
@@ -105,6 +124,7 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
       cancelAnimationFrame(startFrame)
       if (session) void api.closeTerminal(session).catch(() => {})
       sessionRef.current = ''
+      shellReady.current = false
       input.dispose()
       removeData()
       removeCWD()
@@ -119,7 +139,7 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
   useEffect(() => {
     if (path === initialPath.current) return
     initialPath.current = path
-    if (sessionRef.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => {
+    if (sessionRef.current && shellReady.current) void api.terminalChangeDirectory(sessionRef.current, path).catch((reason) => {
       // A refused cd (editing/running program) is not an acknowledgement.
       // Release the navigation gate so the next genuine shell prompt can
       // reconcile the pane; never silently queue keystrokes into that program.
@@ -128,5 +148,8 @@ export default function TerminalPane({ pane, path, active, onCWD, onSyncFailure 
     })
   }, [path])
 
-  return <div className="terminal-host" ref={host} data-testid={`terminal-${pane}`} />
+  return <div className="terminal-view">
+    <div className="terminal-host" ref={host} data-testid={`terminal-${pane}`} />
+    {error && <div className="terminal-error" role="status">{error}</div>}
+  </div>
 }

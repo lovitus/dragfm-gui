@@ -86,8 +86,9 @@ func scpUpload(client *ssh.Client, spec *Spec, cfg scpConfig, reporter *scpRepor
 	session.Stderr = stderr
 
 	cmd := buildSCPCopyCommand("-t", spec.Target, cfg, len(spec.Sources) > 1)
+	cmd = prependRemoteCommand(spec.RemoteCommandPrefix, cmd)
 	if err := session.Start(cmd); err != nil {
-		return 1, fmt.Errorf("start remote scp upload: %w", err)
+		return 1, &ExitUnconfirmedError{Cause: fmt.Errorf("start remote scp upload: %w", err)}
 	}
 
 	writer := bufio.NewWriter(stdin)
@@ -129,7 +130,7 @@ func scpDownload(client *ssh.Client, spec *Spec, cfg scpConfig, reporter *scpRep
 
 	reporter.start()
 	for _, source := range spec.Sources {
-		code, err := scpDownloadOne(client, source, spec.Target, len(spec.Sources) > 1, cfg, reporter)
+		code, err := scpDownloadOne(client, source, spec.Target, len(spec.Sources) > 1, cfg, reporter, spec.RemoteCommandPrefix...)
 		if !isTransferSuccess(code, err) {
 			return code, err
 		}
@@ -138,7 +139,7 @@ func scpDownload(client *ssh.Client, spec *Spec, cfg scpConfig, reporter *scpRep
 	return 0, nil
 }
 
-func scpDownloadOne(client *ssh.Client, remoteSource, localTarget string, forceDir bool, cfg scpConfig, reporter *scpReporter) (int, error) {
+func scpDownloadOne(client *ssh.Client, remoteSource, localTarget string, forceDir bool, cfg scpConfig, reporter *scpReporter, prefix ...string) (int, error) {
 	session, err := client.NewSession()
 	if err != nil {
 		return 1, fmt.Errorf("create scp download session: %w", err)
@@ -157,8 +158,9 @@ func scpDownloadOne(client *ssh.Client, remoteSource, localTarget string, forceD
 	session.Stderr = stderr
 
 	cmd := buildSCPCopyCommand("-f", remoteSource, cfg, false)
+	cmd = prependRemoteCommand(prefix, cmd)
 	if err := session.Start(cmd); err != nil {
-		return 1, fmt.Errorf("start remote scp download: %w", err)
+		return 1, &ExitUnconfirmedError{Cause: fmt.Errorf("start remote scp download: %w", err)}
 	}
 
 	reader := bufio.NewReader(stdout)
@@ -402,6 +404,7 @@ type downloadRoot struct {
 type downloadDir struct {
 	path  string
 	times *fileTimes
+	mode  os.FileMode
 }
 
 func prepareDownloadRoot(localTarget, remoteSource string, forceDir bool) (downloadRoot, error) {
@@ -462,10 +465,29 @@ func receiveIntoRoot(r *bufio.Reader, w *bufio.Writer, root downloadRoot, cfg sc
 					return err
 				}
 			}
-			if err := os.MkdirAll(target, mode); err != nil {
+			existing, statErr := os.Stat(target)
+			if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+				return fmt.Errorf("stat directory %s: %w", target, statErr)
+			}
+			// Keep owner traversal/write access while receiving children, then
+			// restore the requested mode on E. mkdir alone is affected by umask
+			// and cannot preserve -p permissions (notably on empty directories).
+			if err := os.MkdirAll(target, mode|0700); err != nil {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
-			dir := downloadDir{path: target, times: pendingTimes}
+			finalMode := mode
+			if !cfg.preserve {
+				if existing != nil {
+					finalMode = existing.Mode().Perm()
+				} else {
+					created, err := os.Stat(target)
+					if err != nil {
+						return err
+					}
+					finalMode &= created.Mode().Perm() // Retain the actual umask.
+				}
+			}
+			dir := downloadDir{path: target, times: pendingTimes, mode: finalMode}
 			pendingTimes = nil
 			if len(stack) == 1 {
 				rootStarted = true
@@ -478,7 +500,12 @@ func receiveIntoRoot(r *bufio.Reader, w *bufio.Writer, root downloadRoot, cfg sc
 			if len(stack) > 1 {
 				dir := stack[len(stack)-1]
 				if dir.times != nil {
-					_ = os.Chtimes(dir.path, dir.times.atime, dir.times.mtime)
+					if err := os.Chtimes(dir.path, dir.times.atime, dir.times.mtime); err != nil {
+						return fmt.Errorf("set directory times %s: %w", dir.path, err)
+					}
+				}
+				if err := os.Chmod(dir.path, dir.mode); err != nil {
+					return fmt.Errorf("set directory mode %s: %w", dir.path, err)
 				}
 				stack = stack[:len(stack)-1]
 			}
@@ -507,7 +534,7 @@ func receiveIntoRoot(r *bufio.Reader, w *bufio.Writer, root downloadRoot, cfg sc
 			if err := writeSCPAck(w); err != nil {
 				return err
 			}
-			if err := receiveFile(r, target, mode, size, pendingTimes, reporter); err != nil {
+			if err := receiveFile(r, target, mode, size, pendingTimes, cfg.preserve, reporter); err != nil {
 				return err
 			}
 			pendingTimes = nil
@@ -585,7 +612,9 @@ func parseCopyHeader(line string) (os.FileMode, string, int64, error) {
 }
 
 func parseHeaderCommon(line string) (os.FileMode, string, int64, error) {
-	line = strings.TrimSpace(line)
+	// The final LF is framing; whitespace before it belongs to the filename.
+	// Trimming it can collapse distinct siblings ("report" and "report ").
+	line = strings.TrimSuffix(line, "\n")
 	if len(line) < 2 {
 		return 0, "", 0, fmt.Errorf("bad scp control record: %q", line)
 	}
@@ -604,7 +633,7 @@ func parseHeaderCommon(line string) (os.FileMode, string, int64, error) {
 	return os.FileMode(modeValue), fields[2], sizeValue, nil
 }
 
-func receiveFile(r *bufio.Reader, target string, mode os.FileMode, size int64, times *fileTimes, reporter *scpReporter) error {
+func receiveFile(r *bufio.Reader, target string, mode os.FileMode, size int64, times *fileTimes, preserve bool, reporter *scpReporter) error {
 	file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", target, err)
@@ -622,8 +651,13 @@ func receiveFile(r *bufio.Reader, target string, mode os.FileMode, size int64, t
 		msg, _ := r.ReadString('\n')
 		return fmt.Errorf("remote scp error: %s", strings.TrimSpace(string(ack)+msg))
 	}
-	if err := file.Chmod(mode); err != nil {
-		return fmt.Errorf("chmod %s: %w", target, err)
+	// Without -p, OpenFile already retains an existing file's mode or applies
+	// the caller's umask on creation. Do not broaden those permissions after
+	// receiving the contents; only an explicit preserve request restores mode.
+	if preserve {
+		if err := file.Chmod(mode); err != nil {
+			return fmt.Errorf("chmod %s: %w", target, err)
+		}
 	}
 	if times != nil {
 		if err := os.Chtimes(target, times.atime, times.mtime); err != nil {
@@ -662,13 +696,21 @@ func writeSCPAck(w *bufio.Writer) error {
 
 func finishSession(session *ssh.Session, stderr string, prior error) (int, error) {
 	waitErr := session.Wait()
+	var exited *ssh.ExitError
+	if waitErr != nil && !errors.As(waitErr, &exited) {
+		cause := errors.Join(prior, waitErr)
+		if stderr != "" {
+			cause = fmt.Errorf("%w: %s", cause, strings.TrimSpace(stderr))
+		}
+		return 1, &ExitUnconfirmedError{Cause: cause}
+	}
 	if prior != nil {
 		if waitErr != nil {
 			if stderr != "" {
-				return 1, fmt.Errorf("%v: %s", prior, strings.TrimSpace(stderr))
+				return 1, fmt.Errorf("%w: %s", errors.Join(prior, waitErr), strings.TrimSpace(stderr))
 			}
 		}
-		return 1, prior
+		return 1, errors.Join(prior, waitErr)
 	}
 	if waitErr == nil {
 		return 0, nil
@@ -683,6 +725,17 @@ func finishSession(session *ssh.Session, stderr string, prior error) (int, error
 		return 1, errors.New(strings.TrimSpace(stderr))
 	}
 	return 1, waitErr
+}
+
+func prependRemoteCommand(prefix []string, command string) string {
+	if len(prefix) == 0 {
+		return command
+	}
+	words := make([]string, len(prefix))
+	for i, word := range prefix {
+		words[i] = shellEscape(word)
+	}
+	return strings.Join(words, " ") + " " + command
 }
 
 func shellEscape(s string) string {

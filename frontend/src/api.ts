@@ -1,6 +1,6 @@
 import type {
   Bootstrap, Challenge, ConfigTexts, DirectoryListing, DropPreview, JobUpdate,
-  PaneID, TerminalCWD, TerminalData, TransferRequest, VaultStatus,
+  PaneID, TerminalCWD, TerminalData, TransferRequest, VaultStatus, ConnectionOverview,
 } from './types'
 
 type EventMap = {
@@ -46,8 +46,13 @@ export const api = {
   terminalChangeDirectory: (session: string, path: string): Promise<void> => invoke('TerminalChangeDirectory', session, path),
   closeTerminal: (session: string): Promise<void> => invoke('CloseTerminal', session),
   getConfigTexts: (): Promise<ConfigTexts> => invoke('GetConfigTexts'),
-  saveConfigTexts: (markdown: string): Promise<Bootstrap> => invoke('SaveConfigTexts', markdown),
+  saveConfigTexts: (markdown: string, revision?: string): Promise<Bootstrap> => revision ? invoke('SaveConfigTextsAtRevision', markdown, revision) : invoke('SaveConfigTexts', markdown),
+  connectionOverview: (): Promise<ConnectionOverview> => invoke('GetConnectionOverview'),
+  setConnectionPolicy: (kind: 'ssh' | 'socks', id: string, disabled: boolean, relayAllowed: boolean, revision: string): Promise<Bootstrap> => invoke('SetConnectionPolicy', kind, id, disabled, relayAllowed, revision),
+  clearRelayCache: (left: string, right: string, revision: string): Promise<ConnectionOverview> => invoke('ClearRelayCache', left, right, revision),
+  queueConnectionTest: (kind: 'ssh' | 'socks', id: string, targetID: string, revision: string): Promise<string> => invoke('QueueConnectionTest', { kind, id, targetID, revision }),
   setTheme: (theme: Bootstrap['theme']): Promise<void> => invoke('SetTheme', theme),
   resolveChallenge: (id: string, accepted: boolean, value: string, save: boolean): Promise<void> => invoke('ResolveChallenge', id, accepted, value, save),
+  skipChallenge: (id: string): Promise<void> => invoke('SkipChallenge', id),
   lock: (): Promise<void> => invoke('Lock'),
 }

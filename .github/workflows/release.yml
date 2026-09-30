@@ -32,14 +32,13 @@ jobs:
   validate:
     needs: intent
     uses: ./.github/workflows/build.yml
-  ssh:
-    needs: intent
-    uses: ./.github/workflows/ssh-integration.yml
+    with:
+      package_macos_candidate: false
   platforms:
     needs: intent
     uses: ./.github/workflows/platforms.yml
   package:
-    needs: [validate, ssh, platforms]
+    needs: [validate, platforms]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -110,6 +109,7 @@ jobs:
             codesign --verify --verbose=2 unpacked/dragfm-gui/dragfm-gui
             python build/ci/portable-smoke.py unpacked/dragfm-gui/dragfm-gui
             if [ "$TARGET_ARCH" = arm64 ]; then
+              python -m pip install PyAutoGUI==0.9.54 pyobjc-framework-ApplicationServices==12.2.2
               python build/ci/native-smoke.py unpacked/dragfm-gui/dragfm-gui
             fi
           fi

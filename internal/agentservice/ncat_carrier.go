@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/lovitus/dragfm-gui/internal/agentlease"
 )
 
 // ncatCarrier transports bytes through an actual ncat subprocess. The network
@@ -48,6 +50,11 @@ func ncatCarrier(ctx context.Context, upstream net.Conn) (net.Conn, error) {
 		})
 	}
 	stop := context.AfterFunc(life, cleanup)
+	if err := agentlease.Attach(life, command); err != nil {
+		stop()
+		cleanup()
+		return nil, err
+	}
 	if err := command.Start(); err != nil {
 		stop()
 		cleanup()

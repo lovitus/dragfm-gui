@@ -17,9 +17,11 @@ import (
 	"time"
 
 	"github.com/flyssh/flyssh/pkg/connector"
+	flytransfer "github.com/flyssh/flyssh/pkg/transfer"
 	"github.com/lovitus/dragfm-gui/internal/activity"
 	"github.com/lovitus/dragfm-gui/internal/agentproto"
 	"github.com/lovitus/dragfm-gui/internal/assets"
+	"github.com/lovitus/dragfm-gui/internal/config"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"github.com/lovitus/dragfm-gui/internal/transfer"
 )
@@ -27,19 +29,35 @@ import (
 const markerName = ".dragfm-owner-v1"
 
 type Session struct {
-	Protocol  *agentproto.Conn
-	Directory string
-	remote    *endpoint.Remote
-	ssh       io.Closer
-	ctx       context.Context
-	done      chan struct{}
-	stdin     io.WriteCloser
-	once      sync.Once
-	abortOnce sync.Once
-	closeErr  error
-	callMu    sync.Mutex
-	elevated  bool
+	Protocol          *agentproto.Conn
+	Directory         string
+	remote            *endpoint.Remote
+	ssh               io.Closer
+	ctx               context.Context
+	done              chan struct{}
+	stdin             io.WriteCloser
+	once              sync.Once
+	abortOnce         sync.Once
+	closeErr          error
+	callMu            sync.Mutex
+	elevated          bool
+	sudoAuthenticated bool
+	sudoPassword      string
+	filesMu           sync.Mutex
+	files             []*endpoint.Remote
+	filesErr          error // protected by filesMu; unconfirmed file startup
+	installation      config.WorkspaceRecord
+	journal           WorkspaceJournal
 }
+
+// WorkspaceJournal commits intent/inode records synchronously. remove=true is
+// sent only after acknowledged cleanup, never merely after closing a channel.
+type WorkspaceJournal func(record config.WorkspaceRecord, remove bool) error
+
+// True only after a password-bearing sudo invocation completed the helper
+// handshake. A configured root SSH route or an already-root account is not
+// evidence that an offered sudo password was accepted.
+func (s *Session) SudoAuthenticated() bool { return s.sudoAuthenticated }
 
 type Listener struct {
 	Job       string
@@ -79,44 +97,76 @@ func (s *Session) call(ctx context.Context, action string, options, secret map[s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Receiving actions can create the first inode before sending a response.
+	// Persist the scoped absent-path intent first, in a separate read-only
+	// registration round trip, before permitting any payload writer to start.
+	if s.journal != nil {
+		incoming := ""
+		switch action {
+		case "listen-receive", "connect-receive":
+			incoming = options["path"]
+		case "scp-download", "rsync-download":
+			incoming = options["target"]
+		}
+		if incoming != "" {
+			if !validPartialPath(incoming) {
+				return nil, transfer.PreserveSource(errors.New("journaled receiver requires a scoped partial path"))
+			}
+			if _, err := s.exchange(ctx, "track-partial", map[string]string{"path": incoming}, nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return s.exchange(ctx, action, options, secret)
+}
+
+// callMu serializes both protocol frames and the install's durable metadata.
+func (s *Session) exchange(ctx context.Context, action string, options, secret map[string]string) (map[string]string, error) {
 	id := randomHex(12)
 	requestOptions := make(map[string]string, len(options)+1)
 	for key, value := range options {
 		requestOptions[key] = value
 	}
 	requestOptions["progress"] = "true"
+	if s.journal != nil {
+		requestOptions["journal"] = "true"
+	}
 	request := agentproto.Request{Version: agentproto.ProtocolVersion, ID: id, Action: action, Options: requestOptions, Secret: secret}
 	if err := s.Protocol.Send(request); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
+		return nil, &flytransfer.ExitUnconfirmedError{Cause: errors.Join(ctx.Err(), err)}
 	}
 	for {
 		var response agentproto.Response
 		if err := s.Protocol.Receive(&response); err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, err
+			return nil, &flytransfer.ExitUnconfirmedError{Cause: errors.Join(ctx.Err(), err)}
 		}
 		if response.ID != id || response.Version != agentproto.ProtocolVersion {
-			return nil, errors.New("invalid remote helper response")
+			return nil, &flytransfer.ExitUnconfirmedError{Cause: errors.New("invalid remote helper response")}
 		}
 		if response.Progress {
 			count, err := strconv.ParseInt(response.Values["wire_bytes"], 10, 64)
 			if err != nil || count < 0 {
-				return nil, errors.New("invalid helper activity counter")
+				return nil, &flytransfer.ExitUnconfirmedError{Cause: errors.New("invalid helper activity counter")}
 			}
 			if s.ctx != nil {
 				activity.Report(s.ctx, response.Values["action"], count)
 			}
 			continue
 		}
-		if !response.OK {
-			return nil, errors.New(response.Error)
+		var journalErr error
+		if s.journal != nil && action != "remove-owned-temp" && response.ErrorCode != "partial_identity_unconfirmed" {
+			journalErr = s.recordPartials(response.Values["partials"])
 		}
-		return response.Values, nil
+		if !response.OK {
+			if response.ErrorCode == "exit_unconfirmed" {
+				return nil, errors.Join(&flytransfer.ExitUnconfirmedError{Cause: errors.New(response.Error)}, journalErr)
+			}
+			if response.ErrorCode == "partial_identity_unconfirmed" {
+				return nil, transfer.PreserveSource(errors.New(response.Error))
+			}
+			return nil, errors.Join(errors.New(response.Error), journalErr)
+		}
+		return response.Values, journalErr
 	}
 }
 
@@ -124,7 +174,11 @@ func (s *Session) Listen(action, job, path, token string, preserveOwner bool) (L
 	return s.ListenAt(action, job, path, token, preserveOwner, "")
 }
 func (s *Session) ListenAt(action, job, path, token string, preserveOwner bool, bind string) (Listener, error) {
-	values, err := s.Call(action, map[string]string{"job": job, "path": path, "preserve_owner": strconv.FormatBool(preserveOwner), "bind": bind, "ack": "true"}, map[string]string{"token": token})
+	return s.ListenPort(action, job, path, token, preserveOwner, bind, "")
+}
+
+func (s *Session) ListenPort(action, job, path, token string, preserveOwner bool, bind, port string) (Listener, error) {
+	values, err := s.Call(action, map[string]string{"job": job, "path": path, "preserve_owner": strconv.FormatBool(preserveOwner), "bind": bind, "port": port, "ack": "true"}, map[string]string{"token": token})
 	if err != nil {
 		return Listener{}, err
 	}
@@ -162,12 +216,26 @@ func (s *Session) Wait(job string) error {
 	return err
 }
 
+func (s *Session) StopListener(job string) error {
+	_, err := s.Call("listener-stop", map[string]string{"job": job}, nil)
+	return err
+}
+
+func (s *Session) DiscardPartial(path string) error {
+	_, err := s.Call("discard-partial", map[string]string{"path": path}, nil)
+	return err
+}
+
 func (s *Session) SCP(action, source, target, route string, directory bool) error {
 	return s.SCPContext(context.Background(), action, source, target, route, directory)
 }
 
-func (s *Session) SCPContext(ctx context.Context, action, source, target, route string, directory bool) error {
-	_, err := s.CallContext(ctx, action, map[string]string{"source": source, "target": target, "directory": fmt.Sprintf("%t", directory)}, map[string]string{"route": route})
+func (s *Session) SCPContext(ctx context.Context, action, source, target, route string, directory bool, peerHelper ...string) error {
+	options := map[string]string{"source": source, "target": target, "directory": fmt.Sprintf("%t", directory)}
+	if len(peerHelper) > 0 {
+		options["peer_helper"] = peerHelper[0]
+	}
+	_, err := s.CallContext(ctx, action, options, map[string]string{"route": route})
 	return err
 }
 
@@ -175,8 +243,12 @@ func (s *Session) Rsync(action, source, target, route string) error {
 	return s.RsyncContext(context.Background(), action, source, target, route)
 }
 
-func (s *Session) RsyncContext(ctx context.Context, action, source, target, route string) error {
-	_, err := s.CallContext(ctx, action, map[string]string{"source": source, "target": target}, map[string]string{"route": route})
+func (s *Session) RsyncContext(ctx context.Context, action, source, target, route string, peerHelper ...string) error {
+	options := map[string]string{"source": source, "target": target}
+	if len(peerHelper) > 0 {
+		options["peer_helper"] = peerHelper[0]
+	}
+	_, err := s.CallContext(ctx, action, options, map[string]string{"route": route})
 	return err
 }
 
@@ -260,62 +332,84 @@ func (s *Session) StopProcess(job string) error {
 	return err
 }
 
-func Start(ctx context.Context, remote *endpoint.Remote, architecture string) (*Session, error) {
-	return start(ctx, remote, architecture, false, "")
+// Start requires a task-owned transport (normally Remote.Fork). Cancellation
+// may close it to unblock local I/O; that is never remote process-exit evidence.
+func Start(ctx context.Context, remote *endpoint.Remote, architecture string, journals ...WorkspaceJournal) (*Session, error) {
+	return start(ctx, remote, architecture, false, "", journals...)
 }
 
-func StartElevated(ctx context.Context, remote *endpoint.Remote, architecture, sudoPassword string) (*Session, error) {
-	return start(ctx, remote, architecture, true, sudoPassword)
+func StartElevated(ctx context.Context, remote *endpoint.Remote, architecture, sudoPassword string, journals ...WorkspaceJournal) (*Session, error) {
+	return start(ctx, remote, architecture, true, sudoPassword, journals...)
 }
 
-func start(ctx context.Context, remote *endpoint.Remote, architecture string, elevated bool, sudoPassword string) (*Session, error) {
+func start(ctx context.Context, remote *endpoint.Remote, architecture string, elevated bool, sudoPassword string, journals ...WorkspaceJournal) (*Session, error) {
 	if remote == nil {
 		return nil, errors.New("remote endpoint is required")
+	}
+	if strings.ContainsAny(sudoPassword, "\r\n") {
+		return nil, errors.New("sudo password must fit on one input line")
+	}
+	if len(journals) > 1 {
+		return nil, errors.New("helper installation requires at most one recovery journal")
+	}
+	var journal WorkspaceJournal
+	var registrars []func(config.WorkspaceRecord) error
+	if len(journals) == 1 && journals[0] != nil {
+		journal = journals[0]
+		registrars = append(registrars, func(record config.WorkspaceRecord) error { return journal(record, false) })
 	}
 	payload, expectedHash, err := assets.LinuxAgent(architecture)
 	if err != nil {
 		return nil, err
 	}
-	nonce := randomHex(16)
-	directory := "/tmp/.dragfm-" + nonce
-	if err := remote.MkdirAll(ctx, directory, 0700); err != nil {
+	installation, err := createWorkspaceDirectory(ctx, remote, "/tmp", registrars...)
+	if err != nil {
 		return nil, err
 	}
-	cleanup := func() { _ = remote.Remove(context.Background(), directory, true) }
-	markerData, _ := json.Marshal(marker{Version: 1, Created: time.Now().UTC(), Nonce: nonce})
-	if err := writeAtomic(ctx, remote, remote.Join(directory, markerName), markerData, 0600); err != nil {
-		cleanup()
-		return nil, err
+	directory := installation.Directory
+	// Before exec there cannot be a helper child. Still use the pinned marker
+	// and exclusive directory lock, never a blind recursive absolute-path rm.
+	cleanup := func(failure error) error {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := installation.remove(cleanupCtx); err != nil {
+			return errors.Join(failure, transfer.PreserveSource(fmt.Errorf("helper installation %q retained: %w", directory, err)))
+		}
+		if journal != nil {
+			if err := journal(installation.Record(), true); err != nil {
+				return errors.Join(failure, transfer.PreserveSource(fmt.Errorf("helper installation recovery record could not be retired: %w", err)))
+			}
+		}
+		return failure
 	}
 	binaryPath := remote.Join(directory, "dragfm-agent")
 	if err := writeAtomic(ctx, remote, binaryPath, payload, 0700); err != nil {
-		cleanup()
-		return nil, err
+		return nil, cleanup(err)
 	}
 	actualHash, err := remoteHash(ctx, remote, binaryPath)
 	if err != nil || actualHash != expectedHash {
-		cleanup()
 		if err != nil {
-			return nil, err
+			return nil, cleanup(err)
 		}
-		return nil, errors.New("remote helper SHA-256 mismatch")
+		return nil, cleanup(errors.New("remote helper SHA-256 mismatch"))
 	}
+	handshakeCtx, stopDeadline := context.WithTimeout(ctx, 15*time.Second)
+	defer stopDeadline()
+	stopHandshake := watchStartup(handshakeCtx, remote)
+	defer stopHandshake()
 	sshSession, err := remote.SSHClient().NewSession()
 	if err != nil {
-		cleanup()
-		return nil, err
+		return nil, cleanup(err)
 	}
 	stdin, err := sshSession.StdinPipe()
 	if err != nil {
 		_ = sshSession.Close()
-		cleanup()
-		return nil, err
+		return nil, cleanup(err)
 	}
 	stdout, err := sshSession.StdoutPipe()
 	if err != nil {
 		_ = sshSession.Close()
-		cleanup()
-		return nil, err
+		return nil, cleanup(err)
 	}
 	var stderr helperOutput
 	sshSession.Stderr = &stderr
@@ -325,42 +419,49 @@ func start(ctx context.Context, remote *endpoint.Remote, architecture string, el
 			elevated = false
 		}
 	}
-	command := "exec " + quotePOSIX(binaryPath)
-	if elevated {
-		command = "exec sudo -n -- " + quotePOSIX(binaryPath)
-		if sudoPassword != "" {
-			// -k guarantees sudo consumes exactly the password line before the
-			// helper protocol starts. A cached sudo ticket must never leave the
-			// password bytes for the helper to mistake for its handshake.
-			command = "sudo -S -k -p '' -v && exec sudo -n -- " + quotePOSIX(binaryPath)
-		}
-	}
+	command, sudoPrompt := helperCommand(binaryPath, "", elevated, sudoPassword != "")
 	if err := sshSession.Start(command); err != nil {
 		_ = sshSession.Close()
-		cleanup()
-		return nil, fmt.Errorf("start remote helper: %w", err)
+		// The exec request may have reached the server before its reply was
+		// lost. Keep the marked directory rather than guessing it never ran.
+		return nil, &flytransfer.ExitUnconfirmedError{Cause: fmt.Errorf("start remote helper: %w", err)}
 	}
 	if elevated && sudoPassword != "" {
-		if _, err := io.WriteString(stdin, sudoPassword+"\n"); err != nil {
-			_ = sshSession.Close()
-			cleanup()
-			return nil, fmt.Errorf("send sudo credential: %w", err)
+		if _, err := io.WriteString(stdin, sudoInput(sudoPassword, sudoPrompt)); err != nil {
+			exitErr := waitStartupExit(sshSession, stdin, remote)
+			failure := fmt.Errorf("send sudo credential: %w", err)
+			if exitErr != nil {
+				return nil, transfer.PreserveSource(errors.Join(failure, exitErr))
+			}
+			return nil, cleanup(failure)
 		}
 	}
-	handshakeCtx, stopDeadline := context.WithTimeout(ctx, 15*time.Second)
-	stopHandshake := context.AfterFunc(handshakeCtx, func() { _ = sshSession.Close() })
 	protocol, err := agentproto.Client(stdout, stdin)
-	stopHandshake()
-	stopDeadline()
-	if err != nil {
-		_ = sshSession.Close()
-		cleanup()
-		return nil, fmt.Errorf("helper handshake: %w: %s", err, stderr.String())
+	if err == nil && sudoPrompt != "" {
+		// stdout and stderr are drained concurrently. Wait for the explicit
+		// stderr boundary before deciding whether sudo requested a password.
+		err = stderr.waitFor(handshakeCtx, sudoResultMarker(sudoPrompt))
 	}
-	session := &Session{Protocol: protocol, Directory: directory, remote: remote, ssh: sshSession, stdin: stdin, elevated: elevated, ctx: ctx, done: make(chan struct{})}
-	if _, err := session.Call("cleanup-stale-temps", map[string]string{"keep": directory, "older_seconds": strconv.FormatInt(int64((24*time.Hour)/time.Second), 10)}, nil); err != nil {
-		_ = session.Close()
-		return nil, fmt.Errorf("clean stale remote helpers: %w", err)
+	stopHandshake()
+	err = errors.Join(err, handshakeCtx.Err())
+	if err != nil {
+		exitErr := waitStartupExit(sshSession, stdin, remote)
+		failure := fmt.Errorf("helper handshake: %w: %s", err, stderr.String())
+		if exitErr != nil {
+			return nil, transfer.PreserveSource(errors.Join(failure, exitErr))
+		}
+		return nil, cleanup(failure)
+	}
+	session := &Session{Protocol: protocol, Directory: directory, remote: remote, ssh: sshSession, stdin: stdin, elevated: elevated, sudoAuthenticated: sudoPrompt != "" && strings.Contains(stderr.String(), sudoPrompt), ctx: ctx, done: make(chan struct{}), installation: installation.Record(), journal: journal}
+	if elevated {
+		session.sudoPassword = sudoPassword
+	}
+	if journal == nil {
+		// GUI recovery is an explicit queued operation against exact vault
+		// records. Starting a new helper must not also scan unrelated installs.
+		if _, err := session.Call("cleanup-stale-temps", map[string]string{"keep": directory, "older_seconds": strconv.FormatInt(int64((24*time.Hour)/time.Second), 10)}, nil); err != nil {
+			return nil, errors.Join(fmt.Errorf("clean stale remote helpers: %w", err), session.Close())
+		}
 	}
 	go func() {
 		select {
@@ -374,30 +475,19 @@ func start(ctx context.Context, remote *endpoint.Remote, architecture string, el
 
 func quotePOSIX(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 
-func CleanupStale(ctx context.Context, remote *endpoint.Remote, olderThan time.Duration) error {
-	entries, err := remote.List(ctx, "/tmp")
+// CreateDirectory creates a lease-aware helper installation. Every entrypoint
+// locks it before consuming input; helper children inherit the directory fd.
+// mkdir is exclusive: an existing path, including a symlink, is never adopted.
+func CreateDirectory(ctx context.Context, remote endpoint.Endpoint, parent string) (string, error) {
+	work, err := createWorkspaceDirectory(ctx, remote, parent)
 	if err != nil {
-		return err
+		return "", err
 	}
-	now := time.Now()
-	for _, entry := range entries {
-		if !entry.IsDir() || len(entry.Name) < len(".dragfm-")+16 || entry.Name[:len(".dragfm-")] != ".dragfm-" || now.Sub(entry.Modified) < olderThan {
-			continue
-		}
-		markerPath := remote.Join(entry.Path, markerName)
-		reader, err := remote.Open(ctx, markerPath)
-		if err != nil {
-			continue
-		}
-		data, readErr := io.ReadAll(io.LimitReader(reader, 4096))
-		_ = reader.Close()
-		var owner marker
-		if readErr != nil || json.Unmarshal(data, &owner) != nil || owner.Version != 1 || owner.Nonce == "" || entry.Name != ".dragfm-"+owner.Nonce || now.Sub(owner.Created) < olderThan {
-			continue
-		}
-		_ = remote.Remove(ctx, entry.Path, true)
-	}
-	return nil
+	return work.Directory, nil
+}
+
+func CleanupStale(ctx context.Context, remote *endpoint.Remote, olderThan time.Duration) error {
+	return CleanupWorkspaces(ctx, remote, "/tmp", olderThan)
 }
 
 func writeAtomic(ctx context.Context, remote endpoint.Endpoint, path string, data []byte, mode fs.FileMode) error {

@@ -3,10 +3,12 @@ package endpoint
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path"
 	"strconv"
@@ -31,20 +33,109 @@ type Remote struct {
 	sftp           *sftp.Client
 	sftpError      error
 	connectionHost string
+	dialRoute      connector.Route
+	// A task may supply a separate privileged SFTP channel while borrowing the
+	// authenticated SSH identity. Closing that view must not close the chain
+	// used by browsing/PTYs. The transport owns the SFTP client and its EOF/Wait
+	// shutdown, so Remote.Close must not close that client a second time.
+	// Commands still run as the original SSH account.
+	fileTransport io.Closer
+	fileVersion   func(context.Context, string) (uint64, uint64, error)
+	physicalPath  func(context.Context, string) (string, error)
+	partial       func(context.Context, string, bool) error
+	fileOwner     func(context.Context, string, uint32, uint32) error
+	fileSync      func(context.Context, []string) error
+	commands      *commandFilesystem
 }
 
-func DialSSH(ctx context.Context, name, fingerprint string, route connector.Route) (*Remote, error) {
+func (r *Remote) BorrowFileChannel(client *sftp.Client, transport io.Closer, version func(context.Context, string) (uint64, uint64, error), physical func(context.Context, string) (string, error), partial func(context.Context, string, bool) error, owner func(context.Context, string, uint32, uint32) error, syncPaths func(context.Context, []string) error) *Remote {
+	return &Remote{name: r.name, fingerprint: r.fingerprint, client: r.client,
+		sftp: client, connectionHost: r.connectionHost, fileTransport: transport,
+		fileVersion: version, physicalPath: physical, partial: partial, fileOwner: owner, fileSync: syncPaths}
+}
+
+func (r *Remote) SetOwner(ctx context.Context, path string, uid, gid uint32) error {
+	if r.fileOwner == nil {
+		return errors.New("ownership changes require an approved privileged file channel")
+	}
+	return r.fileOwner(ctx, path, uid, gid)
+}
+
+func DialSSH(ctx context.Context, name, _ string, route connector.Route) (*Remote, error) {
+	// The legacy fingerprint argument is display/configuration metadata, not
+	// proof of the key used by this route. Keep only a pin actually enforced by
+	// connector.Dial, or a key that its final-hop confirmation accepted.
+	fingerprint := ""
+	route.Hops = append([]connector.Hop(nil), route.Hops...)
+	verified := make([]string, len(route.Hops))
+	for i := range route.Hops {
+		hop := &route.Hops[i]
+		verified[i] = hop.HostKey.PinnedSHA256
+		if verified[i] == "" && hop.HostKey.ConfirmNew != nil {
+			confirm := hop.HostKey.ConfirmNew
+			hop.HostKey.ConfirmNew = func(address, key string) bool {
+				if !confirm(address, key) {
+					return false
+				}
+				verified[i] = key
+				return true
+			}
+		}
+	}
 	chain, err := connector.Dial(ctx, route)
 	if err != nil {
 		return nil, err
+	}
+	for i := range route.Hops {
+		if verified[i] != "" {
+			route.Hops[i].HostKey.PinnedSHA256 = verified[i]
+			route.Hops[i].HostKey.ConfirmNew = nil
+		}
+	}
+	if len(verified) > 0 {
+		fingerprint = verified[len(verified)-1]
 	}
 	connectionHost := ""
 	if len(route.Hops) > 0 {
 		connectionHost = route.Hops[len(route.Hops)-1].Host
 	}
-	remote := &Remote{name: name, fingerprint: fingerprint, chain: chain, client: chain.Final(), connectionHost: connectionHost}
+	remote := &Remote{name: name, fingerprint: fingerprint, chain: chain, client: chain.Final(), connectionHost: connectionHost, dialRoute: route}
+	// NewClient performs session/subsystem/INIT-VERSION negotiation before it
+	// returns a client. Ordinary watchIO cannot protect this interval yet.
+	// Bound it and close only this newly owned route on cancellation; Fork
+	// must never tear down the original browsing/PTY route.
+	negotiationTimeout := route.Timeout
+	if negotiationTimeout <= 0 || negotiationTimeout > 15*time.Second {
+		negotiationTimeout = 15 * time.Second
+	}
+	negotiation, cancel := context.WithTimeout(ctx, negotiationTimeout)
+	closed := make(chan struct{})
+	stop := context.AfterFunc(negotiation, func() {
+		_ = chain.Close()
+		close(closed)
+	})
 	remote.sftp, remote.sftpError = sftp.NewClient(remote.client)
+	if !stop() {
+		<-closed
+	}
+	negotiationErr := negotiation.Err()
+	cancel()
+	if negotiationErr != nil {
+		_ = remote.Close()
+		return nil, fmt.Errorf("SFTP 初始化未完成: %w", errors.Join(negotiationErr, remote.sftpError))
+	}
+	// A prompt subsystem rejection still permits the existing POSIX fallback.
 	return remote, nil
+}
+
+// Fork opens the exact already-authenticated route, including any composed
+// relay and enforced pins. A task can close its stalled transport without
+// tearing down the browser/PTY transport or rereading edited host settings.
+func (r *Remote) Fork(ctx context.Context) (*Remote, error) {
+	if len(r.dialRoute.Hops) == 0 {
+		return nil, errors.New("remote has no authenticated reconnect route")
+	}
+	return DialSSH(ctx, r.name, r.fingerprint, r.dialRoute)
 }
 
 func (r *Remote) SFTPError() error       { return r.sftpError }
@@ -75,6 +166,9 @@ func (r *Remote) AvailableBytes(ctx context.Context, target string) (int64, erro
 }
 
 func (r *Remote) FileVersion(ctx context.Context, target string) (uint64, uint64, error) {
+	if r.fileVersion != nil {
+		return r.fileVersion(ctx, target)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	statCommand := "if stat -c '%d %i' -- " + shellQuote(target) + " >/dev/null 2>&1; then stat -c '%d %i' -- " + shellQuote(target) + "; else stat -f '%d %i' -- " + shellQuote(target) + "; fi"
@@ -193,6 +287,9 @@ func (r *Remote) List(ctx context.Context, directory string) ([]Entry, error) {
 	entries := make([]Entry, 0, len(items))
 	for _, item := range items {
 		entry := Entry{Name: item.Name(), Path: path.Join(directory, item.Name()), Mode: item.Mode(), Size: item.Size(), Modified: item.ModTime()}
+		if stat, ok := item.Sys().(*sftp.FileStat); ok {
+			entry.UID, entry.GID, entry.OwnerKnown = stat.UID, stat.GID, true
+		}
 		if item.Mode()&fs.ModeSymlink != 0 {
 			entry.LinkTarget, _ = r.sftp.ReadLink(entry.Path)
 		}
@@ -212,7 +309,24 @@ func (r *Remote) Stat(ctx context.Context, target string) (Entry, error) {
 		entries, err := r.findEntries(ctx, target, true)
 		if err != nil {
 			var status bytes.Buffer
-			probe := "if [ -e " + shellQuote(target) + " ] || [ -L " + shellQuote(target) + " ]; then printf exists; elif [ -x " + shellQuote(path.Dir(target)) + " ]; then printf missing; else printf denied; fi"
+			// A missing immediate parent is not evidence of denied traversal.
+			// Walk up to the first existing ancestor, without resolving links or
+			// executing path contents. Only a searchable directory proves ENOENT.
+			probe := "p=" + shellQuote(target) + `
+if [ -e "$p" ] || [ -L "$p" ]; then printf exists; exit; fi
+while :; do
+  case "$p" in
+    /|.) printf unknown; break ;;
+    */*) p=${p%/*}; [ -n "$p" ] || p=/ ;;
+    *) p=. ;;
+  esac
+  if [ -e "$p" ] || [ -L "$p" ]; then
+    if [ ! -d "$p" ]; then printf unknown
+    elif [ -x "$p" ]; then printf missing
+    else printf denied; fi
+    break
+  fi
+done`
 			if probeErr := r.Exec(ctx, probe, ExecOptions{Stdout: &status}); probeErr == nil {
 				switch status.String() {
 				case "missing":
@@ -233,6 +347,9 @@ func (r *Remote) Stat(ctx context.Context, target string) (Entry, error) {
 		return Entry{}, err
 	}
 	entry := Entry{Name: info.Name(), Path: target, Mode: info.Mode(), Size: info.Size(), Modified: info.ModTime()}
+	if stat, ok := info.Sys().(*sftp.FileStat); ok {
+		entry.UID, entry.GID, entry.OwnerKnown = stat.UID, stat.GID, true
+	}
 	if info.Mode()&fs.ModeSymlink != 0 {
 		entry.LinkTarget, _ = r.sftp.ReadLink(target)
 	}
@@ -253,9 +370,12 @@ func (r *Remote) Readlink(ctx context.Context, target string) (string, error) {
 	return strings.TrimSuffix(stdout.String(), "\n"), err
 }
 
-func (r *Remote) open(_ context.Context, target string) (io.ReadCloser, error) {
+func (r *Remote) open(ctx context.Context, target string) (io.ReadCloser, error) {
 	if r.sftp != nil {
 		return r.sftp.Open(target)
+	}
+	if r.commands != nil {
+		return r.openCommandFile(ctx, target)
 	}
 	session, err := r.client.NewSession()
 	if err != nil {
@@ -273,9 +393,17 @@ func (r *Remote) open(_ context.Context, target string) (io.ReadCloser, error) {
 	return &sessionReader{Reader: stdout, session: session}, nil
 }
 
-func (r *Remote) createAtomic(_ context.Context, target string, mode fs.FileMode) (AtomicWriter, error) {
+func (r *Remote) createAtomic(ctx context.Context, target string, mode fs.FileMode) (AtomicWriter, error) {
 	temporary := path.Join(path.Dir(target), ".dragfm-partial-"+randomSuffix())
+	if r.commands != nil {
+		return r.createCommandFile(ctx, temporary, target, mode)
+	}
 	if r.sftp != nil {
+		if r.partial != nil {
+			if err := r.partial(ctx, temporary, true); err != nil {
+				return nil, err
+			}
+		}
 		file, err := r.sftp.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 		if err != nil {
 			return nil, err
@@ -285,7 +413,13 @@ func (r *Remote) createAtomic(_ context.Context, target string, mode fs.FileMode
 			_ = r.sftp.Remove(temporary)
 			return nil, err
 		}
-		return &sftpAtomicWriter{file: file, client: r.sftp, temporary: temporary, target: target}, nil
+		if r.partial != nil {
+			if err := r.partial(ctx, temporary, true); err != nil {
+				_ = file.Close()
+				return nil, err // The owner retains cleanup; no data was written.
+			}
+		}
+		return &sftpAtomicWriter{file: file, client: r.sftp, temporary: temporary, target: target, partial: r.partial}, nil
 	}
 	session, err := r.client.NewSession()
 	if err != nil {
@@ -299,9 +433,11 @@ func (r *Remote) createAtomic(_ context.Context, target string, mode fs.FileMode
 	command := fmt.Sprintf("umask 077; set -C; exec cat > %s", shellQuote(temporary))
 	if err := session.Start(command); err != nil {
 		_ = session.Close()
-		return nil, err
+		return nil, fmt.Errorf("start writer for retained partial %q: %w", temporary, errors.Join(ErrCommandExitUnconfirmed, err))
 	}
-	return &sshAtomicWriter{WriteCloser: stdin, session: session, remote: r, temporary: temporary, target: target, mode: mode}, nil
+	exit := make(chan error, 1)
+	go func() { exit <- session.Wait() }()
+	return &sshAtomicWriter{WriteCloser: stdin, session: session, remote: r, temporary: temporary, target: target, mode: mode, ctx: ctx, exit: exit}, nil
 }
 
 func (r *Remote) MkdirAll(ctx context.Context, target string, mode fs.FileMode) error {
@@ -319,12 +455,34 @@ func (r *Remote) MkdirAll(ctx context.Context, target string, mode fs.FileMode) 
 		return err
 	}
 	if r.sftp != nil {
+		if r.partial != nil {
+			if err := r.partial(ctx, target, true); err != nil {
+				return err
+			}
+		}
 		if err := r.sftp.MkdirAll(target); err != nil {
 			return err
 		}
-		return r.sftp.Chmod(target, mode.Perm())
+		if err := r.sftp.Chmod(target, mode.Perm()); err != nil {
+			return err
+		}
+		if r.partial != nil {
+			return r.partial(ctx, target, true) // Pin the actual directory inode.
+		}
+		return nil
 	}
-	return r.Exec(ctx, fmt.Sprintf("mkdir -p -- %s && chmod %04o -- %s", shellQuote(target), mode.Perm(), shellQuote(target)), ExecOptions{})
+	if r.partial != nil {
+		if err := r.partial(ctx, target, true); err != nil {
+			return err
+		}
+	}
+	if err := r.Exec(ctx, fmt.Sprintf("mkdir -p -- %s && chmod %04o -- %s", shellQuote(target), mode.Perm(), shellQuote(target)), ExecOptions{}); err != nil {
+		return err
+	}
+	if r.partial != nil {
+		return r.partial(ctx, target, true)
+	}
+	return nil
 }
 
 func (r *Remote) Symlink(ctx context.Context, linkTarget, target string) error {
@@ -334,9 +492,31 @@ func (r *Remote) Symlink(ctx context.Context, linkTarget, target string) error {
 	stopIO := r.watchIO(ctx)
 	defer stopIO()
 	if r.sftp != nil {
-		return r.sftp.Symlink(linkTarget, target)
+		if r.partial != nil {
+			if err := r.partial(ctx, target, true); err != nil {
+				return err
+			}
+		}
+		if err := r.sftp.Symlink(linkTarget, target); err != nil {
+			return err
+		}
+		if r.partial != nil {
+			return r.partial(ctx, target, true) // Pin the link, not its target.
+		}
+		return nil
 	}
-	return r.Exec(ctx, "ln -s -- "+shellQuote(linkTarget)+" "+shellQuote(target), ExecOptions{})
+	if r.partial != nil {
+		if err := r.partial(ctx, target, true); err != nil {
+			return err
+		}
+	}
+	if err := r.Exec(ctx, "ln -s -- "+shellQuote(linkTarget)+" "+shellQuote(target), ExecOptions{}); err != nil {
+		return err
+	}
+	if r.partial != nil {
+		return r.partial(ctx, target, true)
+	}
+	return nil
 }
 
 func (r *Remote) Chmod(ctx context.Context, target string, mode fs.FileMode) error {
@@ -373,13 +553,30 @@ func (r *Remote) Remove(ctx context.Context, target string, recursive bool) erro
 		return err
 	}
 	if r.sftp != nil && !recursive {
-		return r.sftp.Remove(target)
+		err := r.sftp.Remove(target)
+		if err == nil && r.partial != nil {
+			return r.partial(ctx, target, false)
+		}
+		return err
+	}
+	if r.sftp != nil && r.fileTransport != nil {
+		err := r.sftp.RemoveAll(target)
+		if err == nil && r.partial != nil {
+			return r.partial(ctx, target, false)
+		}
+		return err
 	}
 	flag := ""
 	if recursive {
 		flag = "-r"
 	}
-	return r.Exec(ctx, "rm "+flag+" -- "+shellQuote(target), ExecOptions{})
+	if err := r.Exec(ctx, "rm "+flag+" -- "+shellQuote(target), ExecOptions{}); err != nil {
+		return err
+	}
+	if r.partial != nil {
+		return r.partial(ctx, target, false)
+	}
+	return nil
 }
 
 func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bool) error {
@@ -399,7 +596,13 @@ func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bo
 				return err
 			}
 		}
-		return renameSFTP(r.sftp, source, target, overwrite)
+		if err := renameSFTP(r.sftp, source, target, overwrite); err != nil {
+			return err
+		}
+		if r.partial != nil {
+			return r.partial(ctx, source, false)
+		}
+		return nil
 	}
 	flag := ""
 	if !overwrite {
@@ -409,7 +612,13 @@ func (r *Remote) Rename(ctx context.Context, source, target string, overwrite bo
 	if !overwrite {
 		command += "; result=$?; [ \"$result\" -eq 0 ] || exit \"$result\"; if [ -e " + shellQuote(source) + " ] || [ -L " + shellQuote(source) + " ]; then exit 73; fi"
 	}
-	return r.Exec(ctx, command, ExecOptions{})
+	if err := r.Exec(ctx, command, ExecOptions{}); err != nil {
+		return err
+	}
+	if r.partial != nil {
+		return r.partial(ctx, source, false)
+	}
+	return nil
 }
 
 func (r *Remote) CopyNative(ctx context.Context, source, target string, sourceDirectory, merge bool) error {
@@ -436,6 +645,9 @@ func (r *Remote) Exec(ctx context.Context, command string, options ExecOptions) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if r.commands != nil {
+		return r.commands.run(ctx, command, options)
+	}
 	stopOpen := r.watchIO(ctx)
 	session, err := r.client.NewSession()
 	stopOpen()
@@ -457,7 +669,21 @@ func (r *Remote) Exec(ctx context.Context, command string, options ExecOptions) 
 		command = "cd -- " + shellQuote(options.Directory) + " && " + command
 	}
 	done := make(chan error, 1)
-	go func() { done <- session.Run(command) }()
+	go func() {
+		if err := session.Start(command); err != nil {
+			// Start's public error does not distinguish a rejected request
+			// from transport loss AFTER the server accepted it. Preserve that
+			// ambiguity instead of permitting cleanup/retry of a possible writer.
+			done <- errors.Join(ErrCommandExitUnconfirmed, err)
+			return
+		}
+		err := session.Wait()
+		var exited *ssh.ExitError
+		if err != nil && !errors.As(err, &exited) {
+			err = errors.Join(ErrCommandExitUnconfirmed, err)
+		}
+		done <- err
+	}()
 	select {
 	case err := <-done:
 		return err
@@ -473,7 +699,8 @@ func (r *Remote) OpenPTY(ctx context.Context, directory, shell string, rows, col
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	loginCommand, cleanupPath, err := r.remoteLoginCommand(ctx, shell)
+	nonce := rand.Text()
+	loginCommand, cleanupPath, err := r.remoteLoginCommand(ctx, shell, nonce)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +737,7 @@ func (r *Remote) OpenPTY(ctx context.Context, directory, shell string, rows, col
 		cleanup()
 		return nil, err
 	}
-	pty := &sshPTY{session: session, input: input, output: output, remote: r, cleanupPath: cleanupPath}
+	pty := &sshPTY{session: session, input: input, output: output, remote: r, cleanupPath: cleanupPath, nonce: nonce}
 	go func() {
 		<-ctx.Done()
 		_ = pty.Close()
@@ -518,10 +745,10 @@ func (r *Remote) OpenPTY(ctx context.Context, directory, shell string, rows, col
 	return pty, nil
 }
 
-func (r *Remote) remoteLoginCommand(ctx context.Context, shell string) (string, string, error) {
+func (r *Remote) remoteLoginCommand(ctx context.Context, shell, nonce string) (string, string, error) {
 	name := strings.ToLower(path.Base(shell))
 	if name == "fish" {
-		return "exec " + shellQuote(shell) + " -l -i -C " + shellQuote(fishCWDHook()), "", nil
+		return "exec " + shellQuote(shell) + " -l -i -C " + shellQuote(fishCWDHook(nonce)), "", nil
 	}
 	directory := "/tmp/.dragfm-shell-" + randomSuffix()
 	if err := r.MkdirAll(ctx, directory, 0700); err != nil {
@@ -549,30 +776,22 @@ func (r *Remote) remoteLoginCommand(ctx context.Context, shell string) (string, 
 	switch name {
 	case "bash":
 		rc := path.Join(directory, "bashrc")
-		if err := write("bashrc", `[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc"
-`+bashCWDHook()); err != nil {
+		if err := write("bashrc", bashStartup(nonce)); err != nil {
 			return fail(err)
 		}
-		command := "exec " + shellQuote(shell) + " -l -c " + shellQuote(`exec "$0" --noprofile --rcfile "$1" -i`) + " " + shellQuote(shell) + " " + shellQuote(rc)
+		command := "exec " + shellQuote(shell) + " --noprofile --rcfile " + shellQuote(rc) + " -i"
 		return command, directory, nil
 	case "zsh":
-		home, err := r.Home(ctx)
-		if err != nil {
-			return fail(err)
-		}
-		for _, file := range []string{".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"} {
-			body := "[[ -r " + shellQuote(path.Join(home, file)) + " ]] && source " + shellQuote(path.Join(home, file)) + "\nexport ZDOTDIR=" + shellQuote(directory) + "\n"
-			if file == ".zlogin" {
-				body += zshCWDHook()
-			}
+		for _, file := range []string{".zshenv", ".zprofile", ".zshrc", ".zlogin"} {
+			body := zshStartup(file, directory, nonce)
 			if err := write(file, body); err != nil {
 				return fail(err)
 			}
 		}
-		return "ZDOTDIR=" + shellQuote(directory) + " exec " + shellQuote(shell) + " -l -i", directory, nil
+		return `__DRAGFM_ZDOTDIR=${ZDOTDIR-} __DRAGFM_ZDOTDIR_SET=${ZDOTDIR+1} ZDOTDIR=` + shellQuote(directory) + " exec " + shellQuote(shell) + " -l -i", directory, nil
 	default:
 		env := path.Join(directory, "env")
-		if err := write("env", posixCWDHook()); err != nil {
+		if err := write("env", posixCWDHook(nonce)); err != nil {
 			return fail(err)
 		}
 		return "ENV=" + shellQuote(env) + " exec " + shellQuote(shell) + " -l -i", directory, nil
@@ -614,15 +833,37 @@ func (r *Remote) Close() error {
 		r.closed.Store(true)
 		// Close transport first, unblocking pending SFTP requests/channel writes.
 		var transportErr, sftpErr error
-		if r.chain != nil {
-			transportErr = r.chain.Close()
+		if r.commands != nil {
+			transportErr = r.commands.close()
+		} else if r.fileTransport != nil {
+			transportErr = r.fileTransport.Close()
+		} else if r.chain != nil {
+			transportErr = unexpectedTransportClose(r.chain.Close())
 		}
-		if r.sftp != nil {
-			sftpErr = r.sftp.Close()
+		if r.sftp != nil && r.fileTransport == nil {
+			sftpErr = unexpectedTransportClose(r.sftp.Close())
 		}
 		r.closeErr = errors.Join(transportErr, sftpErr)
 	})
 	return r.closeErr
+}
+
+// Closing our SSH transport first intentionally gives its SFTP reader EOF.
+// This is not a remote writer exit acknowledgement. Borrowed file transports
+// and command filesystems above keep their own strict process-exit contract;
+// never apply this normalization to their cleanup errors.
+func unexpectedTransportClose(err error) error {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var remaining []error
+		for _, child := range joined.Unwrap() {
+			remaining = append(remaining, unexpectedTransportClose(child))
+		}
+		return errors.Join(remaining...)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
 
 func (r *Remote) listPOSIX(ctx context.Context, directory string) ([]Entry, error) {
@@ -634,7 +875,7 @@ func (r *Remote) findEntries(ctx context.Context, target string, exact bool) ([]
 	if exact {
 		depth = "-maxdepth 0"
 	}
-	command := "LC_ALL=C find -- " + shellQuote(target) + " " + depth + " -printf '%y\\0%f\\0%s\\0%T@\\0%m\\0%l\\0'"
+	command := "LC_ALL=C find -- " + shellQuote(target) + " " + depth + " -printf '%y\\0%f\\0%s\\0%T@\\0%m\\0%l\\0%U\\0%G\\0'"
 	var stdout bytes.Buffer
 	if err := r.Exec(ctx, command, ExecOptions{Stdout: &stdout}); err != nil {
 		return nil, err
@@ -643,19 +884,24 @@ func (r *Remote) findEntries(ctx context.Context, target string, exact bool) ([]
 	if len(fields) > 0 && len(fields[len(fields)-1]) == 0 {
 		fields = fields[:len(fields)-1]
 	}
-	if len(fields)%6 != 0 {
+	if len(fields)%8 != 0 {
 		return nil, errors.New("invalid POSIX directory response")
 	}
-	entries := make([]Entry, 0, len(fields)/6)
-	for index := 0; index < len(fields); index += 6 {
+	entries := make([]Entry, 0, len(fields)/8)
+	for index := 0; index < len(fields); index += 8 {
 		name := string(fields[index+1])
 		entryPath := target
 		if !exact {
 			entryPath = path.Join(target, name)
 		}
-		size, _ := strconv.ParseInt(string(fields[index+2]), 10, 64)
-		seconds, _ := strconv.ParseFloat(string(fields[index+3]), 64)
-		permissions, _ := strconv.ParseUint(string(fields[index+4]), 8, 32)
+		size, sizeErr := strconv.ParseInt(string(fields[index+2]), 10, 64)
+		modified, timeErr := parseFindTime(string(fields[index+3]))
+		permissions, modeErr := strconv.ParseUint(string(fields[index+4]), 8, 32)
+		uid, uidErr := strconv.ParseUint(string(fields[index+6]), 10, 32)
+		gid, gidErr := strconv.ParseUint(string(fields[index+7]), 10, 32)
+		if sizeErr != nil || timeErr != nil || modeErr != nil || uidErr != nil || gidErr != nil {
+			return nil, errors.New("invalid POSIX directory metadata")
+		}
 		mode := fs.FileMode(permissions)
 		switch string(fields[index]) {
 		case "d":
@@ -671,18 +917,45 @@ func (r *Remote) findEntries(ctx context.Context, target string, exact bool) ([]
 		case "b":
 			mode |= fs.ModeDevice
 		}
-		entries = append(entries, Entry{Name: name, Path: entryPath, Mode: mode, Size: size, Modified: time.Unix(0, int64(seconds*1e9)), LinkTarget: string(fields[index+5])})
+		entries = append(entries, Entry{Name: name, Path: entryPath, Mode: mode, Size: size, Modified: modified, LinkTarget: string(fields[index+5]), UID: uint32(uid), GID: uint32(gid), OwnerKnown: true})
 	}
 	sortEntries(entries)
 	return entries, nil
+}
+
+// GNU find's %T@ has a variable-length decimal fraction. Converting the
+// epoch through float64 loses nanoseconds, changing ordering and snapshots.
+func parseFindTime(value string) (time.Time, error) {
+	whole, fraction, _ := strings.Cut(value, ".")
+	seconds, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var nanos int64
+	for i, digit := range fraction {
+		if digit < '0' || digit > '9' {
+			return time.Time{}, errors.New("invalid timestamp fraction")
+		}
+		if i < 9 {
+			nanos = nanos*10 + int64(digit-'0')
+		}
+	}
+	for i := len(fraction); i < 9; i++ {
+		nanos *= 10
+	}
+	if strings.HasPrefix(whole, "-") {
+		nanos = -nanos
+	}
+	return time.Unix(seconds, nanos), nil
 }
 
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 
 type sessionReader struct {
 	io.Reader
-	session *ssh.Session
-	once    sync.Once
+	session  *ssh.Session
+	once     sync.Once
+	closeErr error
 }
 
 type sshPTY struct {
@@ -691,9 +964,11 @@ type sshPTY struct {
 	output      io.Reader
 	remote      *Remote
 	cleanupPath string
+	nonce       string
 	once        sync.Once
 }
 
+func (p *sshPTY) CWDNonce() string      { return p.nonce }
 func (p *sshPTY) Input() io.WriteCloser { return p.input }
 func (p *sshPTY) Output() io.Reader     { return p.output }
 func (p *sshPTY) Resize(rows, columns uint) error {
@@ -712,48 +987,90 @@ func (p *sshPTY) Close() error {
 }
 
 func (r *sessionReader) Close() error {
-	var err error
-	r.once.Do(func() { err = errors.Join(r.session.Close(), r.session.Wait()) })
-	return err
+	r.once.Do(func() {
+		closeErr := r.session.Close()
+		waitErr := r.session.Wait()
+		// A short cat can finish and close its channel before this call.
+		// Only an actual successful exit permits ignoring its already-closed
+		// transport result; missing/nonzero exit evidence must remain an error.
+		if waitErr == nil {
+			closeErr = unexpectedTransportClose(closeErr)
+		}
+		r.closeErr = errors.Join(closeErr, waitErr)
+	})
+	return r.closeErr
 }
 
 type sftpAtomicWriter struct {
 	file              *sftp.File
 	client            *sftp.Client
 	temporary, target string
-	done              bool
+	done, closed      bool
+	closeErr          error
+	partial           func(context.Context, string, bool) error
 }
 
 func (w *sftpAtomicWriter) Write(data []byte) (int, error) { return w.file.Write(data) }
-func (w *sftpAtomicWriter) Close() error                   { return w.file.Close() }
+func (w *sftpAtomicWriter) Close() error {
+	if !w.closed {
+		w.closed = true
+		w.closeErr = w.file.Close()
+	}
+	return w.closeErr
+}
 func (w *sftpAtomicWriter) Commit() error {
 	if w.done {
 		return errors.New("atomic writer already completed")
 	}
 	if _, supported := w.client.HasExtension("fsync@openssh.com"); supported {
 		if err := w.file.Sync(); err != nil {
-			_ = w.Abort()
-			return err
+			return durabilityError{errors.Join(err, w.Abort())}
 		}
 	}
-	if err := w.file.Close(); err != nil {
-		_ = w.Abort()
-		return err
+	if err := w.Close(); err != nil {
+		// Keep ownership registered when the server did not acknowledge CLOSE.
+		// The owning lease must prove the writer stopped before cleanup.
+		w.done = true
+		return fmt.Errorf("SFTP writer close unconfirmed; retained partial %q: %w", w.temporary, errors.Join(ErrCommandExitUnconfirmed, err))
 	}
 	if err := renameSFTP(w.client, w.temporary, w.target, true); err != nil {
-		_ = w.client.Remove(w.temporary)
-		w.done = true
-		return err
+		return errors.Join(err, w.Abort())
 	}
 	w.done = true
+	if w.partial != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return w.partial(ctx, w.temporary, false)
+	}
 	return nil
+}
+
+func (w *sftpAtomicWriter) PrepareStaged() (string, error) {
+	if w.done {
+		return w.temporary, errors.New("atomic writer already completed")
+	}
+	if err := w.Close(); err != nil {
+		return w.temporary, errors.Join(ErrCommandExitUnconfirmed, err)
+	}
+	return w.temporary, nil
 }
 func (w *sftpAtomicWriter) Abort() error {
 	if w.done {
 		return nil
 	}
 	w.done = true
-	return errors.Join(w.file.Close(), w.client.Remove(w.temporary))
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("SFTP writer close unconfirmed; retained partial %q: %w", w.temporary, errors.Join(ErrCommandExitUnconfirmed, err))
+	}
+	if err := w.client.Remove(w.temporary); err != nil {
+		return err
+	}
+	if w.partial != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return w.partial(ctx, w.temporary, false)
+	}
+	return nil
 }
 
 type sshAtomicWriter struct {
@@ -763,41 +1080,89 @@ type sshAtomicWriter struct {
 	temporary, target string
 	mode              fs.FileMode
 	done, closed      bool
+	ctx               context.Context
+	exit              <-chan error
+	waitOnce          sync.Once
+	exitErr, closeErr error
+	abortErr          error
 }
 
 func (w *sshAtomicWriter) Close() error {
 	if w.closed {
-		return nil
+		return w.closeErr
 	}
 	w.closed = true
-	return w.WriteCloser.Close()
+	w.closeErr = w.WriteCloser.Close()
+	return w.closeErr
+}
+
+func (w *sshAtomicWriter) wait(ctx context.Context) error {
+	w.waitOnce.Do(func() {
+		select {
+		case err := <-w.exit:
+			w.exitErr = err
+			var status *ssh.ExitError
+			if err != nil && !errors.As(err, &status) {
+				w.exitErr = errors.Join(ErrCommandExitUnconfirmed, err)
+			}
+		case <-ctx.Done():
+			// Reuse the bounded TERM/Wait/KILL path. Closing an SSH channel
+			// alone never authorizes erasing a path still open by remote cat.
+			w.exitErr = w.remote.cancelCommand(ctx, w.session, w.exit)
+		}
+		_ = w.session.Close()
+	})
+	return w.exitErr
 }
 func (w *sshAtomicWriter) Commit() error {
 	if w.done {
 		return errors.New("atomic writer already completed")
 	}
 	if err := w.Close(); err != nil {
-		_ = w.Abort()
-		return err
+		return errors.Join(err, w.Abort())
 	}
-	if err := w.session.Wait(); err != nil {
-		_ = w.Abort()
-		return err
+	if err := w.wait(w.ctx); err != nil {
+		return errors.Join(err, w.Abort())
 	}
 	command := fmt.Sprintf("chmod %04o -- %s && sync -f -- %s && mv -f -T -- %s %s", w.mode.Perm(), shellQuote(w.temporary), shellQuote(w.temporary), shellQuote(w.temporary), shellQuote(w.target))
-	if err := w.remote.Exec(context.Background(), command, ExecOptions{}); err != nil {
-		_ = w.Abort()
-		return err
+	if err := w.remote.Exec(w.ctx, command, ExecOptions{}); err != nil {
+		// A commit command can itself outlive a failed transport. Do not
+		// race its fsync/rename with cleanup in a second SSH session.
+		if errors.Is(err, ErrCommandExitUnconfirmed) {
+			w.done = true
+			return fmt.Errorf("commit unconfirmed; retained partial %q: %w", w.temporary, err)
+		}
+		return errors.Join(err, w.Abort())
 	}
 	w.done = true
 	return nil
 }
+
+func (w *sshAtomicWriter) PrepareStaged() (string, error) {
+	if w.done {
+		return w.temporary, errors.New("atomic writer already completed")
+	}
+	return w.temporary, errors.Join(w.Close(), w.wait(w.ctx))
+}
 func (w *sshAtomicWriter) Abort() error {
 	if w.done {
-		return nil
+		return w.abortErr
 	}
 	w.done = true
-	_ = w.WriteCloser.Close()
-	_ = w.session.Close()
-	return w.remote.Exec(context.Background(), "rm -f -- "+shellQuote(w.temporary), ExecOptions{})
+	closeErr := w.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	exitErr := w.wait(ctx)
+	cancel()
+	if errors.Is(exitErr, ErrCommandExitUnconfirmed) {
+		w.abortErr = fmt.Errorf("writer exit unconfirmed; retained partial %q: %w", w.temporary, errors.Join(closeErr, exitErr))
+		return w.abortErr
+	}
+	cleanup, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stop()
+	removeErr := w.remote.Exec(cleanup, "rm -f -- "+shellQuote(w.temporary), ExecOptions{})
+	w.abortErr = errors.Join(closeErr, exitErr, removeErr)
+	if w.abortErr != nil {
+		w.abortErr = fmt.Errorf("partial shutdown/cleanup %q: %w", w.temporary, w.abortErr)
+	}
+	return w.abortErr
 }

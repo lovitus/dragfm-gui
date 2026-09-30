@@ -15,6 +15,7 @@ import (
 
 	"github.com/flyssh/flyssh/pkg/connector"
 	"github.com/lovitus/dragfm-gui/internal/activity"
+	"github.com/lovitus/dragfm-gui/internal/config"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"github.com/lovitus/dragfm-gui/internal/routespec"
 	"github.com/lovitus/dragfm-gui/internal/strategy"
@@ -25,6 +26,17 @@ import (
 // attempt must not hide untested SCP/encrypted/ncat paths behind one green test.
 func TestHostedReviewedTransportMatrix(t *testing.T) {
 	source, target, document := fixtureEndpoints(t)
+	// The fixture intentionally separates ordinary and root SSH identities.
+	// These elevated method cells require an explicit peer root credential;
+	// they must not rely on the old cross-account reuse of the login key.
+	rootKey, err := os.ReadFile(os.Getenv("DRAGFM_E2E_ROOT_KEY"))
+	if err != nil {
+		t.Fatal("explicit fixture root identity unavailable", err)
+	}
+	document.Keys = append(document.Keys, config.PrivateKey{ID: "matrix-root", Name: "matrix-root", PEM: string(rootKey)})
+	for i := range document.Hosts {
+		document.Hosts[i].RootKeyIDs = []string{"matrix-root"}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	sourceRoot, targetRoot := remoteTempDir(t, ctx, source), remoteTempDir(t, ctx, target)

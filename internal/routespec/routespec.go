@@ -3,7 +3,9 @@ package routespec
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -13,6 +15,26 @@ import (
 )
 
 type KeyLookup func(string) (*config.PrivateKey, bool)
+
+// MatchingHostPrefix compares server addresses along the route, not passwords
+// or key-slot names. Editing a login credential must not erase an existing
+// server pin and silently turn the next connection back into TOFU.
+func MatchingHostPrefix(before, after string) int {
+	identityOnly := func(string) (*config.PrivateKey, bool) { return &config.PrivateKey{}, true }
+	left, err := ParseSSH(before, identityOnly)
+	if err != nil {
+		return 0
+	}
+	right, err := ParseSSH(after, identityOnly)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for count < len(left) && count < len(right) && left[count].Host == right[count].Host && left[count].Port == right[count].Port {
+		count++
+	}
+	return count
+}
 
 func ParseSSH(value string, lookup KeyLookup) ([]connector.Hop, error) {
 	arguments, err := splitArguments(value)
@@ -33,7 +55,7 @@ func ParseSSH(value string, lookup KeyLookup) ([]connector.Hop, error) {
 		case strings.HasPrefix(argument, "--keys="):
 			keySlots = strings.Split(unquote(strings.TrimPrefix(argument, "--keys=")), ",")
 		case strings.HasPrefix(argument, "-"):
-			return nil, fmt.Errorf("暂不支持路由选项 %q", argument)
+			return nil, errors.New("路由仅支持 --keys 选项")
 		default:
 			hopValues = append(hopValues, argument)
 		}
@@ -52,7 +74,8 @@ func ParseSSH(value string, lookup KeyLookup) ([]connector.Hop, error) {
 	for index, raw := range hopValues {
 		parsed, err := cli.ParseHopSpec(raw)
 		if err != nil {
-			return nil, fmt.Errorf("第 %d 跳: %w", index+1, err)
+			// Upstream errors may contain the complete, not-yet-saved secret.
+			return nil, fmt.Errorf("第 %d 跳: 应为 user[:password]@host[:port]", index+1)
 		}
 		credentials := connector.Credentials{UseAgent: true, Password: parsed.Password}
 		if index < len(keySlots) {
@@ -78,19 +101,94 @@ func ParseSOCKS(value string) (connector.SOCKS5, error) {
 	if value == "" {
 		return connector.SOCKS5{}, errors.New("SOCKS 配置不能为空")
 	}
-	parsed, err := url.Parse("socks5://" + value)
-	if err != nil || parsed.Host == "" {
-		return connector.SOCKS5{}, fmt.Errorf("SOCKS 格式应为 user:pass@ip:port: %w", err)
+	badFormat := errors.New("SOCKS 格式应为 user:pass@host:port；IPv6 地址需写为 [地址]:端口")
+	result := connector.SOCKS5{Address: value}
+	if strings.HasPrefix(value, "socks5://") {
+		// Explicit URLs retain the percent-escaped syntax used by v1 vaults.
+		// Never return url.Error: its URL field includes unsaved credentials.
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+			return connector.SOCKS5{}, badFormat
+		}
+		result.Address = parsed.Host
+		if parsed.User != nil {
+			result.Username = parsed.User.Username()
+			result.Password, _ = parsed.User.Password()
+		}
+	} else if at := strings.LastIndexByte(value, '@'); at >= 0 {
+		credentials := value[:at]
+		user, password, ok := strings.Cut(credentials, ":")
+		if !ok || user == "" {
+			return connector.SOCKS5{}, badFormat
+		}
+		result.Username, result.Password, result.Address = user, password, value[at+1:]
 	}
-	result := connector.SOCKS5{Address: parsed.Host}
-	if parsed.User != nil {
-		result.Username = parsed.User.Username()
-		result.Password, _ = parsed.User.Password()
+	host, port, err := net.SplitHostPort(result.Address)
+	if err != nil || host == "" || strings.ContainsAny(host, " /?#@\t\r\n") {
+		return connector.SOCKS5{}, badFormat
 	}
-	if !strings.Contains(parsed.Host, ":") {
-		return connector.SOCKS5{}, errors.New("SOCKS 地址缺少端口")
+	for _, char := range port {
+		if char < '0' || char > '9' {
+			return connector.SOCKS5{}, badFormat
+		}
 	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return connector.SOCKS5{}, errors.New("SOCKS 端口必须在 1–65535 范围内")
+	}
+	result.Address = net.JoinHostPort(host, strconv.Itoa(number))
 	return result, nil
+}
+
+// WithPasswords replaces only named hop passwords, keeping --keys positions
+// and all other hop text intact. This makes saved credentials visible and
+// removable in the user's one-line FlySSH route instead of a hidden overlay.
+func WithPasswords(value string, replacements map[int]string) (string, error) {
+	arguments, err := splitArguments(value)
+	if err != nil {
+		return "", err
+	}
+	hop := 0
+	for index := 0; index < len(arguments); index++ {
+		argument := arguments[index]
+		if argument == "--keys" {
+			index++
+			if index >= len(arguments) {
+				return "", errors.New("--keys 缺少参数")
+			}
+			continue
+		}
+		if strings.HasPrefix(argument, "--keys=") {
+			continue
+		}
+		if strings.HasPrefix(argument, "-") {
+			return "", errors.New("路由仅支持 --keys 选项")
+		}
+		if password, ok := replacements[hop]; ok {
+			parsed, err := cli.ParseHopSpec(argument)
+			if err != nil {
+				return "", fmt.Errorf("第 %d 跳: 应为 user[:password]@host[:port]", hop+1)
+			}
+			user := parsed.User
+			if strings.HasPrefix(user, "-") || strings.IndexFunc(user, func(char rune) bool {
+				return !unicode.IsLetter(char) && !unicode.IsDigit(char) && !strings.ContainsRune("_.-", char)
+			}) >= 0 {
+				user = quoteCredential(user)
+			}
+			arguments[index] = user + ":" + quoteCredential(password) + "@" + net.JoinHostPort(parsed.Host, strconv.Itoa(parsed.Port))
+		}
+		hop++
+	}
+	for index := range replacements {
+		if index < 0 || index >= hop {
+			return "", errors.New("密码对应的 SSH 跳点不存在")
+		}
+	}
+	return strings.Join(arguments, " "), nil
+}
+
+func quoteCredential(value string) string {
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, `'`, `\'`).Replace(value) + `"`
 }
 
 func splitArguments(value string) ([]string, error) {

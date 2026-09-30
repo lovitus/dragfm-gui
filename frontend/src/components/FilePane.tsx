@@ -120,6 +120,7 @@ export default function FilePane(props: FilePaneProps) {
   const [path, setPath] = useState(model.listing.path)
   const [terminalHeight, setTerminalHeight] = useState(180)
   const [terminalEndpoint, setTerminalEndpoint] = useState<string | null>(null)
+  const connectionKey = `${model.listing.endpoint}:${model.listing.connectionID ?? 0}`
   const body = useRef<HTMLElement>(null)
   const resizeCleanup = useRef<(() => void) | null>(null)
   useEffect(() => () => resizeCleanup.current?.(), [])
@@ -127,8 +128,8 @@ export default function FilePane(props: FilePaneProps) {
   useEffect(() => {
     // Saved labels are not connected endpoints until the initial listing resolves.
     // Once connected, keep the PTY mounted during same-endpoint refreshes.
-    if (!model.loading && !model.error) setTerminalEndpoint(model.listing.endpoint)
-  }, [model.loading, model.error, model.listing.endpoint])
+    if (!model.loading && !model.error) setTerminalEndpoint(connectionKey)
+  }, [model.loading, model.error, connectionKey])
   const resizeTerminal = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault()
     resizeCleanup.current?.()
@@ -148,16 +149,20 @@ export default function FilePane(props: FilePaneProps) {
       <header className="pane-toolbar">
         <span className="pane-label">{pane === 'left' ? 'L' : 'R'}</span>
         <select aria-label={`${pane}主机`} value={model.listing.endpoint} onChange={(event) => props.onEndpoint(event.target.value)}>{hosts.map((host) => <option key={host}>{host}</option>)}</select>
-        <form className="path-form" onSubmit={(event) => { event.preventDefault(); if (path.trim()) props.onNavigate(path.trim()) }}>
-          <input aria-label={`${pane}路径`} spellCheck={false} value={path} onFocus={props.onFocus} onChange={(event) => setPath(event.target.value)} />
+        <form className="path-form" onSubmit={(event) => { event.preventDefault(); if (path) props.onNavigate(path) }}>
+          {/* Paths are literal identifiers, not prose. Keep IME editing, but
+              opt out of WebKit's separate spelling and inline predictions.
+              writingsuggestions is not yet in our pinned React DOM types. */}
+          <input aria-label={`${pane}路径`} spellCheck={false} autoComplete="off" autoCorrect="off" autoCapitalize="none" {...{ writingsuggestions: 'false' }} value={path} onFocus={props.onFocus} onChange={(event) => setPath(event.target.value)} />
         </form>
         <button className="icon-button" type="button" title="上一级 (Backspace)" onClick={() => props.onNavigate(parentPath(model.listing.path))}><Icon name="up" /></button>
         <button className="icon-button" type="button" title="刷新" onClick={props.onRefresh}><Icon name="refresh" /></button>
       </header>
-      <div className="file-table-header" role="row"><span>名称</span><span>大小</span><span>修改时间</span><span>权限</span></div>
+      <div className="file-table-header" role="row"><span>名称</span><span>大小</span><span title="按修改时间从新到旧排列">修改时间 ↓</span><span>权限</span></div>
       <div className="file-list-shell">
         {model.loading && <div className="loading-line" />}
         {model.error && <div className="pane-error"><Icon name="alert" />{model.error}</div>}
+        {model.listing.warning && <div className="pane-error" role="status"><Icon name="alert" />{model.listing.warning}</div>}
         {!model.error && <VirtualFileList key={`${model.listing.endpoint}:${model.listing.path}`} pane={pane} entries={model.listing.entries} selected={model.selected} dropTarget={dropTarget?.pane === pane ? dropTarget.directory : ''} onFocus={props.onFocus} onSelect={props.onSelect} onOpen={(entry) => entry.directory ? props.onNavigate(entry.path) : props.onSelect(entry)} onBeginDrag={props.onBeginDrag} />}
       </div>
       <footer className="pane-statusbar">
@@ -167,8 +172,8 @@ export default function FilePane(props: FilePaneProps) {
       <div className="split-handle horizontal" role="separator" aria-orientation="horizontal" aria-label="调整终端高度" onPointerDown={resizeTerminal} />
       <div className="terminal-panel" style={{ height: terminalHeight }}>
         <div className="terminal-title"><span><Icon name="terminal" />Shell</span><span>{model.listing.endpoint} · {model.listing.path}</span></div>
-        {terminalEndpoint === model.listing.endpoint
-          ? <TerminalPane key={`${pane}:${model.listing.endpoint}`} pane={pane} path={model.listing.path} active={active} onCWD={(next) => props.onNavigate(next, true)} onSyncFailure={props.onSyncFailure} />
+        {terminalEndpoint === connectionKey
+          ? <TerminalPane key={`${pane}:${connectionKey}`} pane={pane} path={model.listing.path} active={active} onCWD={(next) => props.onNavigate(next, true)} onSyncFailure={props.onSyncFailure} />
           : <div className="empty-state">等待端点连接后启动终端…</div>}
       </div>
     </section>

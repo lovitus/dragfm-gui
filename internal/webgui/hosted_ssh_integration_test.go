@@ -5,6 +5,8 @@ package webgui
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -15,11 +17,72 @@ import (
 	"time"
 
 	"github.com/lovitus/dragfm-gui/internal/config"
+	"github.com/lovitus/dragfm-gui/internal/configtext"
 	"github.com/lovitus/dragfm-gui/internal/endpoint"
 	"github.com/lovitus/dragfm-gui/internal/strategy"
 	"github.com/lovitus/dragfm-gui/internal/transfer"
 	"github.com/lovitus/dragfm-gui/internal/vault"
 )
+
+// The selected proxy is the authenticated SOCKS server provisioned by the
+// hosted fixture. Exercise the public queue/policy RPCs, not a substitute
+// dialer; a controller login must not masquerade as remote-transfer evidence.
+func TestHostedSelectedSOCKSLoginAndDisable(t *testing.T) {
+	_, _, document := fixtureEndpoints(t)
+	proxySpec := os.Getenv("DRAGFM_E2E_SOCKS_SPEC")
+	if proxySpec == "" {
+		t.Fatal("hosted SOCKS fixture is required for selected-route acceptance")
+	}
+	for i := range document.Hosts {
+		host := &document.Hosts[i]
+		host.RouteSpec = fmt.Sprintf(`%s@%s:%d --keys "%s"`, host.User, host.Address, host.Port, strings.Join(host.KeyIDs, ","))
+		host.HopFingerprints = []string{host.HostFingerprint}
+	}
+	document.SOCKS = []config.SOCKSProxy{{ID: "selected-proxy", Name: "Selected SOCKS", Spec: proxySpec}}
+	app := unlockedTestApp(t)
+	app.mu.Lock()
+	app.document = document
+	app.mu.Unlock()
+	if _, err := app.SaveConfigTexts(configtext.Markdown(document)); err != nil {
+		t.Fatal(err)
+	}
+	events := observeCommands(t, app)
+	request := map[string]any{"kind": "socks", "id": "selected-proxy", "targetID": document.Hosts[1].ID, "revision": configurationRevision(t, app)}
+	encoded, err := connectionRPC(app, "QueueConnectionTest", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := json.Unmarshal(encoded, &id); err != nil {
+		t.Fatal(err)
+	}
+	result := awaitCommandEvent(t, events, id, func(job outputJobWire) bool { return job.State == "succeeded" || job.State == "failed" })
+	if result.State != "succeeded" {
+		t.Fatal("selected authenticated SOCKS route did not complete real SSH login")
+	}
+	app.mu.RLock()
+	proxy := *app.document.SOCKSByID("selected-proxy")
+	qualified := app.sessionSSH[document.Hosts[1].ID]
+	app.mu.RUnlock()
+	if qualified || !proxy.LastSuccess.IsZero() || proxy.LastRTT != 0 {
+		t.Fatal("one-off controller test qualified a different saved route or overwrote real transfer ranking")
+	}
+	if _, err := connectionRPC(app, "SetConnectionPolicy", "socks", "selected-proxy", true, false, configurationRevision(t, app)); err != nil {
+		t.Fatal(err)
+	}
+	request["revision"] = configurationRevision(t, app)
+	if _, err := connectionRPC(app, "QueueConnectionTest", request); err == nil {
+		t.Fatal("disabled SOCKS proxy was admitted for a new connection")
+	}
+	text, err := app.GetConfigTexts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, proxies, err := configtext.ParseMarkdown(text.Markdown, document)
+	if err != nil || len(proxies) != 1 || !proxies[0].Disabled {
+		t.Fatal("SOCKS disable policy was not persisted in editable Markdown")
+	}
+}
 
 func fixtureEndpoints(t *testing.T) (*endpoint.Remote, *endpoint.Remote, config.Document) {
 	t.Helper()
@@ -299,6 +362,61 @@ func TestHostedNonRootSudoTransfers(t *testing.T) {
 				t.Fatal("copy removed or replaced source")
 			}
 			t.Log(fmt.Sprintf("ordinary %s blocked; scoped sudo %s transferred verified contents", direction, direction))
+		})
+	}
+}
+
+// A configured/offered password is valid input even when this host happens to
+// allow NOPASSWD. sudo need not consume it; the next protocol must never see it.
+// This uses the real non-root SSH account and real sudo from the disposable
+// hosted fixture, not a replacement sudo program or a mocked transfer endpoint.
+func TestHostedSudoUnusedPasswordDoesNotEnterHelperProtocol(t *testing.T) {
+	if os.Getenv("DRAGFM_E2E_SUDO") == "" {
+		t.Skip("non-root sudo fixture not enabled")
+	}
+	source, _, document := fixtureEndpoints(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	root := remoteTempDir(t, ctx, source)
+	t.Cleanup(func() {
+		_ = source.Exec(context.Background(), "sudo -n rm -rf -- "+shellQuote(root), endpoint.ExecOptions{})
+	})
+	file := source.Join(root, "protected.txt")
+	contents := "credential framing fixture\n"
+	writeRemoteFile(t, ctx, source, file, contents)
+	if err := source.Exec(ctx, "sudo -n chown root:root -- "+shellQuote(file)+" && sudo -n chmod 0600 -- "+shellQuote(file), endpoint.ExecOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if reader, err := source.Open(ctx, file); err == nil {
+		reader.Close()
+		t.Fatal("fixture did not protect the source from the ordinary SSH account")
+	}
+	var architecture bytes.Buffer
+	if err := source.Exec(ctx, "uname -m", endpoint.ExecOptions{Stdout: &architecture}); err != nil {
+		t.Fatal(err)
+	}
+	app := New(filepath.Join(t.TempDir(), "unused.vault"))
+	defer app.Lock()
+	app.document = document
+	wanted := fmt.Sprintf("%x", sha256.Sum256([]byte(contents)))
+	for _, password := range []string{"", "unused-fixture-only-password"} {
+		name := "password-free"
+		if password != "" {
+			name = "unused-password"
+		}
+		t.Run(name, func(t *testing.T) {
+			agent, cleanup, err := app.startTransferAgent(ctx, source, strings.TrimSpace(architecture.String()), true, password)
+			if err != nil {
+				t.Fatalf("real sudo helper could not start: %v", err)
+			}
+			defer cleanup()
+			manifest, err := agent.Manifest(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(manifest.Items) != 1 || manifest.Items[0].SHA256 != wanted {
+				t.Fatal("privileged helper did not read the complete protected file")
+			}
 		})
 	}
 }

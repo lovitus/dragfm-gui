@@ -1,8 +1,8 @@
 name: native-platforms
+# The user requested macOS arm64 first, then the other targets only after
+# their validation. build.yml remains the automatic macOS/native-input gate.
+# Keep this matrix available for that later explicitly requested delivery.
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
   workflow_call:
 permissions:

@@ -145,7 +145,14 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
       latest = mergeJobUpdates(latest, updates)
       setJobs(latest)
       const changes = latest.filter((job) => old.get(job.id) !== job)
-      if (changes.length) setActivity((activity) => [...activity, ...changes.map((job) => ({ ...job, observedAt: new Date().toISOString() }))].slice(-500))
+      // Transcripts are replaceable snapshots in jobs, not timeline deltas.
+      // Avoid retaining hundreds of 64-KiB snapshots or repeating the same
+      // "command running" entry for each output flush.
+      const events = changes.filter((job) => {
+        const previous = old.get(job.id)
+        return !previous || job.state !== previous.state || job.stage !== previous.stage || job.method !== previous.method || job.message !== previous.message
+      })
+      if (events.length) setActivity((activity) => [...activity, ...events.map(({ output: _output, ...job }) => ({ ...job, observedAt: new Date().toISOString() }))].slice(-500))
       if (changes.some((job) => isFinished(job) && !old.get(job.id)?.finishedAt)) {
         window.clearTimeout(refreshTimer)
         refreshTimer = window.setTimeout(() => { void load('left', undefined, undefined, true); void load('right', undefined, undefined, true) }, 80)
@@ -180,6 +187,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     try {
       const listing = await api.changeEndpoint(pane, endpoint, modelsRef.current[peer].listing.endpoint)
       if (revision !== revisions.current[pane]) return
+      modelsRef.current = { ...modelsRef.current, [pane]: { listing, loading: false, error: '' } }
       setModels((old) => ({ ...old, [pane]: { listing, loading: false, error: '' } }))
     } catch (reason) {
       if (revision !== revisions.current[pane]) return
@@ -232,7 +240,7 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
     const request = { ...dropPreview, move, overwrite: dropPreview.conflict }
     if (await runAction(() => api.queueTransfer(request))) setDropPreview(null)
   }
-  const currentHistory: HistoryEntry[] = jobs.filter((job) => ['succeeded', 'failed', 'cancelled'].includes(job.state)).map((job) => ({ id: job.id, operation: job.description, success: job.state === 'succeeded', message: job.message, finishedAt: job.finishedAt || '' }))
+  const currentHistory: HistoryEntry[] = jobs.filter((job) => ['succeeded', 'failed', 'cancelled'].includes(job.state)).map((job) => ({ id: job.id, operation: job.description, success: job.state === 'succeeded', message: job.message, output: job.output, method: job.method, state: job.state, finishedAt: job.finishedAt || '' }))
   const currentIDs = new Set(currentHistory.map((item) => item.id))
   const history = [...bootstrap.history.filter((item) => !currentIDs.has(item.id)), ...currentHistory]
   const select = (pane: PaneID, entry?: FileEntry) => setModels((old) => ({ ...old, [pane]: { ...old[pane], selected: entry } }))
@@ -287,7 +295,15 @@ export default function Workspace({ initial, onLock, challengeOpen = false }: { 
         <div className="delete-confirm"><Icon name="trash" /><div><strong>{deleteEntry.entry.name}</strong><p>{deleteEntry.entry.path}</p></div></div>
         <footer className="modal-footer"><span>删除任务将进入队列，并在完成后刷新两栏。</span><button className="secondary-button" onClick={() => setDeleteEntry(null)}>取消</button><button className="danger-button" onClick={() => { void runAction(() => api.queueDelete(deleteEntry.pane, deleteEntry.entry.path, deleteEntry.entry.directory)).then((success) => { if (success) setDeleteEntry(null) }) }}>删除</button></footer>
       </Modal>}
-      {settings && <ConfigEditor onClose={() => setSettings(false)} onSaved={(next) => { setBootstrap(next); setSettings(false) }} />}
+      {settings && <ConfigEditor onClose={() => setSettings(false)} onSaved={(next, close = true) => {
+        setBootstrap(next)
+        if (close) setSettings(false)
+        for (const pane of ['left', 'right'] as const) {
+          const current = modelsRef.current[pane].listing.endpoint
+          if (!next.hosts.includes(current)) void changeEndpoint(pane, '本机')
+          else if (close) void changeEndpoint(pane, current)
+        }
+      }} />}
     </div>
   )
 }

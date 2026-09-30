@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,39 @@ type integrationSSHServer struct {
 	config   *ssh.ServerConfig
 	sftp     bool
 	wg       sync.WaitGroup
+	// Deliberately accepting INIT without VERSION exercises client setup,
+	// not an already-established SFTP request or a subsystem rejection.
+	stallSFTPInit    atomic.Bool
+	sftpInitSeen     chan struct{}
+	sftpInitRelease  chan struct{}
+	observeExecClose atomic.Bool
+	execClosed       chan struct{}
+}
+
+func TestRemoteIdentityUsesTheAuthenticatedFinalHop(t *testing.T) {
+	for _, policy := range []string{"pinned", "confirmed"} {
+		t.Run(policy, func(t *testing.T) {
+			_, route := startIntegrationSSHServer(t, true)
+			want := route.Hops[0].HostKey.PinnedSHA256
+			if policy == "confirmed" {
+				route.Hops[0].HostKey = connector.HostKeyPolicy{ConfirmNew: func(_ string, key string) bool { return key == want }}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			remote, err := DialSSH(ctx, "identity-fixture", "unverified-display-fingerprint", route)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer remote.Close()
+			identity, err := remote.Identity(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if identity.Fingerprint != want {
+				t.Fatalf("endpoint identity did not retain the authenticated final-hop key: %q", identity.Fingerprint)
+			}
+		})
+	}
 }
 
 func startIntegrationSSHServer(t *testing.T, enableSFTP bool) (*integrationSSHServer, connector.Route) {
@@ -63,10 +97,12 @@ func startIntegrationSSHServer(t *testing.T, enableSFTP bool) (*integrationSSHSe
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &integrationSSHServer{listener: listener, config: serverConfig, sftp: enableSFTP}
+	server := &integrationSSHServer{listener: listener, config: serverConfig, sftp: enableSFTP,
+		sftpInitSeen: make(chan struct{}, 1), sftpInitRelease: make(chan struct{}), execClosed: make(chan struct{}, 1)}
 	server.wg.Add(1)
 	go server.serve()
 	t.Cleanup(func() {
+		close(server.sftpInitRelease)
 		_ = listener.Close()
 		server.wg.Wait()
 	})
@@ -131,6 +167,16 @@ func (s *integrationSSHServer) handleSession(channel ssh.Channel, requests <-cha
 				continue
 			}
 			_ = request.Reply(true, nil)
+			if s.stallSFTPInit.Load() {
+				// Standard SFTP INIT is length(4), type(1), version(4).
+				var init [9]byte
+				if _, err := io.ReadFull(channel, init[:]); err != nil || init[4] != 1 {
+					return
+				}
+				s.sftpInitSeen <- struct{}{}
+				<-s.sftpInitRelease
+				return
+			}
 			server, err := sftp.NewServer(channel)
 			if err == nil {
 				err = server.Serve()
@@ -144,6 +190,15 @@ func (s *integrationSSHServer) handleSession(channel ssh.Channel, requests <-cha
 			var payload [4]byte
 			binary.BigEndian.PutUint32(payload[:], uint32(status))
 			_, _ = channel.SendRequest("exit-status", false, payload[:])
+			if s.observeExecClose.Load() {
+				// Observe the client's actual channel-close acknowledgement.
+				// The test can now call its reader.Close after the SSH channel
+				// has certainly closed, without sleeps or protocol substitutes.
+				_ = channel.Close()
+				for range requests {
+				}
+				s.execClosed <- struct{}{}
+			}
 			return
 		default:
 			_ = request.Reply(false, nil)
@@ -222,12 +277,43 @@ func TestRemoteSFTPAndSafePOSIXFallback(t *testing.T) {
 			if err := os.Symlink("name with spaces", filepath.Join(root, "link")); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.WriteFile(filepath.Join(root, ".hidden"), []byte("hidden"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(root, "a-old-dir"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			for index, name := range []string{"a-old-dir", "name with spaces", ".hidden"} {
+				modified := time.Unix(1700000000+int64(index), 123456789)
+				if err := os.Chtimes(filepath.Join(root, name), modified, modified); err != nil {
+					t.Fatal(err)
+				}
+			}
 			entries, err := remote.List(context.Background(), root)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(entries) != 2 || entries[0].Name != "link" || entries[0].LinkTarget != "name with spaces" || entries[1].Name != "name with spaces" {
+			if len(entries) != 4 || entries[0].Name != "link" || entries[0].LinkTarget != "name with spaces" || entries[1].Name != ".hidden" || entries[2].Name != "name with spaces" || entries[3].Name != "a-old-dir" {
 				t.Fatalf("unexpected entries: %#v", entries)
+			}
+			for _, entry := range entries {
+				actual, err := localEntry(entry.Path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !entry.OwnerKnown || entry.UID != actual.UID || entry.GID != actual.GID {
+					t.Fatal("directory entry lost actual UID/GID")
+				}
+				stated, err := remote.Stat(context.Background(), entry.Path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !stated.OwnerKnown || stated.UID != actual.UID || stated.GID != actual.GID {
+					t.Fatal("Stat lost actual UID/GID")
+				}
+				if !enabled && (!entry.Modified.Equal(actual.Modified) || !stated.Modified.Equal(actual.Modified)) {
+					t.Fatal("POSIX listing rounded the filesystem timestamp")
+				}
 			}
 			if enabled && remote.SFTPError() != nil {
 				t.Fatalf("SFTP unexpectedly unavailable: %v", remote.SFTPError())

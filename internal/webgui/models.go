@@ -33,6 +33,9 @@ type HistoryEntryModel struct {
 	Operation  string `json:"operation"`
 	Success    bool   `json:"success"`
 	Message    string `json:"message"`
+	Method     string `json:"method,omitempty"`
+	State      string `json:"state,omitempty"`
+	Output     string `json:"output,omitempty"`
 	FinishedAt string `json:"finishedAt"`
 }
 
@@ -47,10 +50,12 @@ type FileEntryModel struct {
 }
 
 type DirectoryListing struct {
-	Pane     PaneID           `json:"pane"`
-	Endpoint string           `json:"endpoint"`
-	Path     string           `json:"path"`
-	Entries  []FileEntryModel `json:"entries"`
+	Warning      string           `json:"warning,omitempty"`
+	ConnectionID uint64           `json:"connectionID"`
+	Pane         PaneID           `json:"pane"`
+	Endpoint     string           `json:"endpoint"`
+	Path         string           `json:"path"`
+	Entries      []FileEntryModel `json:"entries"`
 }
 
 type DropPreview struct {
@@ -75,6 +80,7 @@ type JobUpdateModel struct {
 	State         string  `json:"state"`
 	Description   string  `json:"description"`
 	Message       string  `json:"message"`
+	Output        string  `json:"output,omitempty"`
 	Progress      float64 `json:"progress"`
 	ProgressKnown bool    `json:"progressKnown"`
 	Indeterminate bool    `json:"indeterminate"`
@@ -90,6 +96,40 @@ type JobUpdateModel struct {
 
 type ConfigTexts struct {
 	Markdown string `json:"markdown"`
+	Revision string `json:"revision"`
+}
+
+type ConnectionRow struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Disabled     bool   `json:"disabled"`
+	RelayAllowed bool   `json:"relayAllowed"`
+	RelayReady   bool   `json:"relayReady"`
+	LastRTT      int64  `json:"lastRTT"`
+	LastSuccess  string `json:"lastSuccess"`
+}
+
+type RelayCacheModel struct {
+	EndpointAID string `json:"endpointAID"`
+	EndpointBID string `json:"endpointBID"`
+	EndpointA   string `json:"endpointA"`
+	EndpointB   string `json:"endpointB"`
+	Relay       string `json:"relay"`
+	LastSuccess string `json:"lastSuccess"`
+}
+
+type ConnectionOverview struct {
+	Revision string            `json:"revision"`
+	Hosts    []ConnectionRow   `json:"hosts"`
+	SOCKS    []ConnectionRow   `json:"socks"`
+	Relays   []RelayCacheModel `json:"relays"`
+}
+
+type ConnectionTestRequest struct {
+	Kind     string `json:"kind"`
+	ID       string `json:"id"`
+	TargetID string `json:"targetID"` // SOCKS test destination: a specific saved SSH route.
+	Revision string `json:"revision"`
 }
 
 type ChallengeModel struct {
@@ -99,12 +139,14 @@ type ChallengeModel struct {
 	Message   string `json:"message"`
 	Secret    bool   `json:"secret,omitempty"`
 	AllowSave bool   `json:"allowSave,omitempty"`
+	AllowSkip bool   `json:"allowSkip,omitempty"`
 }
 
 type challengeAnswer struct {
 	Accepted bool
 	Value    string
 	Save     bool
+	Skipped  bool
 }
 
 type terminalDataModel struct {

@@ -1,0 +1,15 @@
+diff --git a/frontend/src/components/FilePane.tsx b/frontend/src/components/FilePane.tsx
+--- a/frontend/src/components/FilePane.tsx
++++ b/frontend/src/components/FilePane.tsx
+@@ -92,9 +92,8 @@
+       <div className="file-spacer" style={{ height: entries.length * ROW_HEIGHT }}>
+-        {entries.slice(range.start, range.end).map((entry, offset) => {
+-          const index = range.start + offset
++        {entries.slice(range.start, range.end).map((entry) => {
+           const selectedRow = selected?.path === entry.path
+           return (
+             <div className={`file-row${selectedRow ? ' selected' : ''}${dropTarget === entry.path ? ' drop-target' : ''}`}
+-              style={{ transform: `translateY(${index * ROW_HEIGHT}px)` }} key={entry.path} role="row" tabIndex={selectedRow ? 0 : -1}
++              key={entry.path} role="row" tabIndex={selectedRow ? 0 : -1}
+               data-file-path={entry.path} data-drop-directory={entry.directory ? entry.path : undefined} data-pane={pane}
+               onClick={(event) => { event.currentTarget.focus(); onSelect(entry) }} onDoubleClick={() => onOpen(entry)}

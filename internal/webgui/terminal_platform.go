@@ -17,5 +17,5 @@ func terminalCDForEndpoint(target endpoint.Endpoint, directory string) string {
 func powershellCDCommand(directory string) string {
 	// Single-quoted PowerShell literals do not expand $, backticks or subexpressions.
 	// -LiteralPath also prevents wildcard characters in file names being interpreted.
-	return "Set-Location -LiteralPath '" + strings.ReplaceAll(directory, "'", "''") + "'; Write-Host -NoNewline ([string][char]27 + '[2K' + [char]13)\r"
+	return "Set-Location -LiteralPath '" + strings.ReplaceAll(directory, "'", "''") + "'\r"
 }

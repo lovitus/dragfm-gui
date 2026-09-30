@@ -3,6 +3,7 @@ package agentservice
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -63,7 +64,11 @@ func TestServeReportsRemoteActivityAndCleansOnControlEOF(t *testing.T) {
 	_ = front.Close()
 	select {
 	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
+		// We deliberately destroyed the duplex pipe. If Handle finishes as
+		// EOF cancels it, Serve may attempt its final response and retain the
+		// original write-side ErrClosedPipe rather than context.Canceled.
+		// Both are valid disconnect results; owned cleanup below is mandatory.
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrClosedPipe) {
 			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):

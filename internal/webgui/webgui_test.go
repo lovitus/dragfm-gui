@@ -16,9 +16,9 @@ import (
 
 func TestFilterCWDMarkersAcrossReads(t *testing.T) {
 	t.Parallel()
-	reader := io.MultiReader(strings.NewReader("before\x1b]777;drag"), strings.NewReader("fm-cwd=/tmp/work\x07after"))
+	reader := io.MultiReader(strings.NewReader("before\x1b]777;drag"), strings.NewReader("fm-cwd=v1;test-session;L3RtcC93b3Jr\x07after"))
 	var directory string
-	output, err := io.ReadAll(filterCWDMarkers(reader, func(value string) { directory = value }))
+	output, err := io.ReadAll(endpoint.FilterCWDMarkers(reader, "test-session", func(value string) { directory = value }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,8 @@ func TestFilterCWDMarkersDoesNotHoldPromptTail(t *testing.T) {
 	t.Parallel()
 	source, input := io.Pipe()
 	defer input.Close()
-	filtered := filterCWDMarkers(source, func(string) {})
+	filtered := endpoint.FilterCWDMarkers(source, "test-session", func(string) {})
+	defer filtered.Close()
 	prompt := []byte("fanli@host /Users % ")
 	go func() { _, _ = input.Write(prompt) }()
 	result := make(chan []byte, 1)
@@ -148,6 +149,12 @@ func TestLocalListAndDirectoryDropTarget(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(leftDirectory, "note.txt"), []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	for index, name := range []string{"folder", "note.txt"} {
+		modified := time.Unix(1700000000+int64(index), 0)
+		if err := os.Chtimes(filepath.Join(leftDirectory, name), modified, modified); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	app := New(filepath.Join(directory, "test.vault"))
 	defer app.Lock()
@@ -163,7 +170,7 @@ func TestLocalListAndDirectoryDropTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listing.Entries) != 2 || !listing.Entries[0].Directory {
+	if len(listing.Entries) != 2 || listing.Entries[0].Name != "note.txt" || !listing.Entries[1].Directory {
 		t.Fatalf("unexpected listing: %+v", listing.Entries)
 	}
 	preview, err := app.PrepareDrop(LeftPane, filepath.Join(leftDirectory, "note.txt"), RightPane, filepath.Join(rightDirectory, "target"))
@@ -196,7 +203,7 @@ func TestTerminalChangeDirectoryUsesAbsoluteQuotedPath(t *testing.T) {
 		t.Fatalf("quote=%q", got)
 	}
 	command := terminalCDCommand("/tmp/a'b")
-	if command != "cd -- '/tmp/a'\\''b'; printf '\\033[2K\\r'\n" {
+	if command != "cd -- '/tmp/a'\\''b'\n" {
 		t.Fatalf("command=%q", command)
 	}
 }

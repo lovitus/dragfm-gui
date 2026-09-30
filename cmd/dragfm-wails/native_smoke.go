@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -91,6 +92,8 @@ func (s *nativeSmoke) domReady(ctx context.Context) {
 			if err != nil {
 				_, _ = fmt.Fprintln(os.Stderr, "native smoke report:", err)
 			}
+			// The hosted parent waits on this event, not a report-file poll.
+			_, _ = fmt.Fprintln(os.Stdout, "DRAGFM_NATIVE_REPORT")
 			go func() { time.Sleep(3 * time.Second); runtime.Quit(ctx) }()
 		})
 	}
@@ -111,6 +114,39 @@ func (s *nativeSmoke) domReady(ctx context.Context) {
 		}
 		finish(report)
 	})
+	// An inherited pipe to the disposable hosted parent, never a listening
+	// control service. The parent sends OS input; this binary does not synthesize
+	// DOM events. Ordinary startup does not register this hook or consume stdin.
+	if os.Getenv("GITHUB_ACTIONS") == "true" {
+		var inputMu sync.Mutex
+		replies := bufio.NewScanner(os.Stdin)
+		replies.Buffer(make([]byte, 4096), 32768)
+		runtime.EventsOn(ctx, "__dragfm_native_input__", func(values ...interface{}) {
+			if len(values) != 1 {
+				return
+			}
+			request, ok := values[0].(string)
+			if !ok || len(request) > 16384 || !json.Valid([]byte(request)) || strings.ContainsAny(request, "\r\n") {
+				finish(map[string]any{"success": false, "error": "invalid native input request"})
+				return
+			}
+			go func() {
+				inputMu.Lock()
+				defer inputMu.Unlock()
+				select {
+				case <-done:
+					return
+				default:
+				}
+				_, err := fmt.Fprintln(os.Stdout, "DRAGFM_NATIVE_INPUT "+request)
+				if err != nil || !replies.Scan() || !json.Valid(replies.Bytes()) {
+					finish(map[string]any{"success": false, "error": "native input parent closed or returned invalid data"})
+					return
+				}
+				runtime.EventsEmit(ctx, "__dragfm_native_input_result__", replies.Text())
+			}()
+		})
+	}
 	go func() {
 		timer := time.NewTimer(240 * time.Second)
 		defer timer.Stop()

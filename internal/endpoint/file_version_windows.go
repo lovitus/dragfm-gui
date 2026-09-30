@@ -2,7 +2,12 @@
 
 package endpoint
 
-import "golang.org/x/sys/windows"
+import (
+	"golang.org/x/sys/windows"
+	"os"
+)
+
+func localFileOwner(os.FileInfo) (uint32, uint32, bool) { return 0, 0, false }
 
 func localFileVersion(path string) (uint64, uint64, error) {
 	name, err := windows.UTF16PtrFromString(path)

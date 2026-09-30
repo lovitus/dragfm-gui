@@ -60,6 +60,20 @@ func FilesystemChildMain(args []string, stdin io.Reader, stdout, stderr io.Write
 	ctx := context.Background()
 	path := args[3]
 	switch args[1] {
+	case "sync":
+		err = local.SyncPaths(ctx, []string{path})
+	case "version":
+		device, inode, e := local.FileVersion(ctx, path)
+		err = e
+		if err == nil {
+			err = json.NewEncoder(stdout).Encode([2]uint64{device, inode})
+		}
+	case "physical":
+		resolved, e := local.PhysicalPath(ctx, path)
+		err = e
+		if err == nil {
+			err = json.NewEncoder(stdout).Encode(resolved)
+		}
 	case "stat":
 		entry, e := local.Stat(ctx, path)
 		err = e

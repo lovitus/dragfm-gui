@@ -30,7 +30,7 @@ export default function Unlock({ status, busy, error, onUnlock, onCreate }: Prop
         </div>
         <form onSubmit={submit}>
           {!status.exists && (
-            <label>主密码提示<input autoFocus value={hint} onChange={(event) => setHint(event.target.value)} placeholder="必填；不要填写密码本身" /></label>
+            <label>主密码提示<input autoFocus value={hint} onChange={(event) => setHint(event.target.value)} autoCorrect="off" autoCapitalize="none" spellCheck={false} placeholder="必填；不要填写密码本身" /></label>
           )}
           {status.exists && <div className="hint"><span>提示</span>{status.hint || '未设置'}</div>}
           <label>主密码<input autoFocus={status.exists} type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" /></label>

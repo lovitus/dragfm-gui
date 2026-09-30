@@ -29,6 +29,9 @@ type Spec struct {
 	Flags     []string
 	Sources   []string
 	Target    string
+	// Optional argv prefix for an authenticated task-owned remote supervisor.
+	// Each word is shell-quoted; nil preserves the existing FlySSH CLI command.
+	RemoteCommandPrefix []string
 }
 
 func FromOptions(opts *cli.Options) (*Spec, error) {
